@@ -1,0 +1,55 @@
+# Python build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+dist/
+build/
+*.so
+
+# IDE / editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Environment and tooling
+.claude/
+.workflow/
+.env
+*.log
+
+# Experiment outputs and logs
+outputs/
+output_multi/
+experiments/outputs/
+experiments/logs/
+experiments/configs/
+experiments/models/
+experiments/stats/
+experiments/*.log
+logs/
+tmp_eval/
+
+# Data files (symlinks handled separately)
+data/*.jsonl
+brumo_2025.jsonl
+aime25.jsonl
+
+# Binary artifacts
+*.jar
+
+# Internal verification configs (not for public release)
+scripts/configs/aime25_llama_budget512_a6000_verify.yaml
+
+# Misc
+prompt.txt
+
+# LongLive integration outputs and symlinks
+videos/
+longlive_models
+wan_models
+example/
+longlive/__pycache__/

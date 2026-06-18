@@ -1,0 +1,3 @@
+[submodule "longlive/longlive"]
+	path = longlive/longlive
+	url = https://github.com/NVlabs/LongLive.git
