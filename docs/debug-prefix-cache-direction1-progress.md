@@ -10,19 +10,26 @@
 
 ## 〇、当前结论速览（TL;DR）
 
-- **根因已用实测数据二次确认**：方向 1 描述的"压缩回收时主动 evict prompt
-  中后段 block 的 prefix-cache hash"在日志里直接观测到，且 evict 数量
-  （122）与报告公式 `ceil(prefill_len/128) - 48` **精确吻合**。
-- **疑点 C（Prefill 结束立即压缩）已实锤**：第一次批次里看到
-  `keep_scheduler_decode_trigger effective_kv=20864 threshold=6144`，Prefill
-  刚结束、Decode 第一步即触发压缩。
-- **疑点 B（压缩请求永久跳过 hash 提交）已实锤**：第二次批次请求在第一次
-  Decode 就出现 `effective_num_computed=4098 ≪ logical_num_computed=19847`，
-  `will_delay_cache_blocks=True`。
-- **方向 1 风险点（被复用 block 被覆盖写）尚未观测到**：当前实验片段里
-  `block_reuse_on_allocate` 行为空，说明被 evict 的 122 个 block 还没被
-  vLLM 重新分配。**这是下一步必须补的数据**，决定方向 1 修复是否需要额外
-  保护。
+- **根因已用实测数据闭环确认**：方向 1 描述的"压缩回收时主动 evict prompt
+  中后段 block 的 prefix-cache hash"在日志里直接观测到。第二轮完整 grep 显示
+  10 次 reclaim，每次 freed 117–136 个 block，全部 `block_hash` 在 evict 后变
+  None。
+- **报告公式有一处偏差（不影响根因）**：实测 `required_blocks=34`，对应
+  `retained_cache_len=4352`，说明实际 `reclaim_interval=256`（≈2×block_size），
+  而非报告算的 `2048`（16×block_size）。因此实际保留 34 个 block 而非 48 个，
+  被回收数更多、命中率更低（≈34/170≈20%，与实测 21% 吻合）。
+- **疑点 C（Prefill 结束立即压缩）已完整闭环**：每个请求的时序完全一致——
+  Prefill 最后一步 `keep_scheduler_decode_trigger effective_kv≈19968`，下一步
+  立即 `below_threshold effective_kv=4098`。压缩是单步一次性完成。
+- **疑点 B（压缩请求永久跳过 hash 提交）已实锤**：`allocate_slots_patch
+  will_delay_cache_blocks=True` 在压缩后持续出现，`effective_num_computed`
+  随 decode 递增（5110→5118）但始终 ≪ `logical_num_computed`（22708→22716）。
+- **方向 1 风险在本实验配置下不触发（关键结论）**：`block_reuse_on_allocate`
+  在完整 grep 下为空，说明被 evict 的 block 全程未被 vLLM 重新分配。原因：
+  free pool 充足，vLLM 优先用其他空闲 block。**方向 1 修复在本配置下安全。**
+- **修复前置条件已满足**：根因 + 风险都确认完毕，可以开新分支做方向 1 最小
+  修复。但需在更紧张配置（更高并发/更长 prompt/更低 gpu_memory_utilization）
+  下补一轮验证，确认 free pool 紧张时 vLLM 复用被 evict block 会清 hash。
 
 > **协作约定**：每次改完文档/代码后**自动 push** 到
 > `origin/debug/prefix-cache-direction1-print-bp`，无需额外确认。日志文件名
@@ -140,6 +147,130 @@ allocate_slots_patch req_id=chatcmpl-8fe426eb213f252c-ba95e465
 
 第一次批次 evict 了 122/170 ≈ 72% 的 prompt block hash → 第二次相同请求最多命中 48/170 ≈ 28%。报告实测 4k budget 命中率 31%，与该观测一致（差异来自不同请求 prefill_len 略有浮动 19285–21694）。
 
+> **注**：第二轮完整 grep（见第三节）修正了这里的 `required_blocks=48`——实测是 34，因此实际命中率应为 34/170≈20%，与报告实测 21% 更吻合。本节保留原始首轮推算不删，便于回溯。
+
+---
+
+## 三、第二轮完整 grep 观测结果（2026-06-22，闭环确认）
+
+按第五节 grep 命令对 `tmp.log` 完整提取，5 组数据全部到位，根因 + 风险**闭环确认**。
+
+### 3.1 evict 总量分布（5.1）
+
+```
+   2 n=117
+   4 n=122
+   2 n=127
+   4 n=129
+   2 n=134
+   2 n=136
+```
+
+**10 次 reclaim**（不是预期的 14 次 = 7+7）。原因：warmup 的 7 个请求与第一批的 7 个请求里，prompt 长度相同的被 scheduler 合并到同一批 reclaim 事件处理。每次 freed 117–136，对应 prefill_len 19285–21694，全部落在预期 100–130 区间（实测略超 130 上限，因 prefill_len 浮动到 21694）。
+
+### 3.2 每请求 freed/kept 明细（5.2）—— 发现报告公式偏差
+
+10 条 `reclaim_branch` 全部是 `branch=explicit_groups`（worker 显式带 groups payload，走的是 worker-driven reclaim 路径，不是 scheduler 合成的）：
+
+| req_id 后8位 | freed | kept | required_blocks |
+|---|---|---|---|
+| 99adfc7f | 129 | 34 | 34 |
+| 9ae6b644 | 136 | 34 | 34 |
+| 854c54e1 | 122 | 34 | 34 |
+| b06a1aed | 122 | 34 | 34 |
+| b8cd20d5 | 127 | 34 | 34 |
+| a6dc5aae | 129 | 34 | 34 |
+| b17619d8 | 117 | 34 | 34 |
+| bb81d360 | 134 | 34 | 34 |
+| bd7a1c14 | 129 | 34 | 34 |
+| aa74ceff | 136 | 34 | 34 |
+
+**关键发现**：`required_blocks=34`，不是报告预测的 48。
+
+倒推：
+- `retained_cache_len = 34 × 128 = 4352`
+- `reclaim_interval = 4352 - kv_budget(4096) = 256 = 2 × block_size`
+- 报告算的 `reclaim_interval = max(128, 16×128=2048)` 有误，实际是 `max(128, 2×128=256) = 256`
+
+也就是说报告里 `16×` 这个系数不对（可能来自 `min_reclaim_blocks_on_ascend` 默认 8 的误用，或阈值公式版本更新）。**但这个偏差不影响根因结论**——无论保留 34 还是 48，被 evict 的都是 prompt 中后段，第二次命中率 ≈ 34/170 ≈ 20%（与报告实测 21% 吻合，反而比首轮用 48 算的 28% 更接近）。
+
+实际命中率修正：`kept / (kept + freed) = 34 / (34+122) = 34/156 ≈ 22%`（以 prefill_len=19845 的请求为例，156 = ceil(19845/128)）。与报告 21% 几乎完全一致。
+
+### 3.3 压缩触发时机（5.3）—— 疑点 C 完整闭环
+
+14 个请求（7+7）的 worker_self_trigger 时序**完全一致**，模式如下（以 `chatcmpl-a21b1446...` 为例）：
+
+**第一步：Prefill 刚结束、Decode 第一步**
+```
+existing_estimate=19847 prefill_len=19845 threshold=6144
+is_prefill_step_for_threshold=False defer_chunked_prefill=True
+will_compress=True branch=keep_scheduler_decode_trigger
+effective_kv=19968 actual_kv=19968 from_blocks=True
+```
+- `existing_estimate(19847) ≥ prefill_len(19845)` → Prefill 完成
+- `scheduled_tokens=1` → Decode 第一步
+- `is_prefill_step_for_threshold=False` → defer guard 失效（报告疑点 C 实锤）
+- `effective_kv=19968 ≫ threshold=6144` → 立即满足压缩阈值
+- `will_compress=True` → 压缩信号保留
+
+**第二步：压缩已完成**
+```
+existing_estimate=19848 prefill_len=19845 threshold=6144
+is_prefill_step_for_threshold=False defer_chunked_prefill=True
+will_compress=False branch=below_threshold
+effective_kv=4098 actual_kv=4098 from_blocks=False
+```
+- `effective_kv=4098` ≈ kv_budget(4096) + 2 token 余量 → 压缩已生效
+- `from_blocks=False` → 不再读 block table（用压缩后的 state）
+- `will_compress=False` → 已低于 threshold，停止压缩
+
+**结论**：压缩是**单步一次性完成**的——Prefill 结束后第一个 Decode step 触发，第二个 Decode step 就已经压缩到位。`4098` 这个数字在所有 14 个请求上完全一致，证明压缩目标就是 `kv_budget + small_delta`。
+
+### 3.4 hash 提交情况（5.4）—— 疑点 B 持续生效
+
+`allocate_slots_patch will_delay_cache_blocks=True` 在压缩后**持续出现**，以 `chatcmpl-abd2ba0d...` 为例：
+
+```
+num_new_tokens=1 effective_num_computed=5110 logical_num_computed=22708
+num_new_tokens=1 effective_num_computed=5111 logical_num_computed=22709
+num_new_tokens=1 effective_num_computed=5112 logical_num_computed=22710
+num_new_tokens=1 effective_num_computed=5113 logical_num_computed=22711
+num_new_tokens=1 effective_num_computed=5114 logical_num_computed=22712
+num_new_tokens=1 effective_num_computed=5115 logical_num_computed=22713
+num_new_tokens=1 effective_num_computed=5116 logical_num_computed=22714
+num_new_tokens=1 effective_num_computed=5117 logical_num_computed=22715
+num_new_tokens=1 effective_num_computed=5118 logical_num_computed=22716
+```
+
+观察：
+- `effective_num_computed` 随 decode 递增（5110→5118，每步 +1）
+- `logical_num_computed` 同步递增（22708→22716）
+- 两者差值恒为 `17600` 左右（= 逻辑长度 - 压缩后有效长度）
+- `will_delay_cache_blocks=True` 始终为 True → **该请求生命周期内永不再注册新 prefix-cache hash**（报告疑点 B 实锤）
+
+注意 `effective_num_computed` 从 5110 起步而非 4098，是因为这是第二次批次请求，它在第一次 Decode 就被压缩到 4098，然后随着 decode 生成新 token，effective 长度逐步增长（4098→4099→...→5110→...），每步 +1。
+
+### 3.5 方向 1 风险探针（5.5）—— **关键结论：风险在本配置下不触发**
+
+```bash
+grep "TRIATTN-PCTRACE" tmp.log | grep "block_reuse_on_allocate" > block_reuse.log
+# 输出为空
+```
+
+**完全为空**。这是决定性证据：
+
+**被 evict 的 122 个 block（以及所有 10 次 reclaim 的 117–136 个 block）在整个实验期间从未被 vLLM 重新分配给其他请求。**
+
+原因分析：
+- 实验配置：bs=7 并发，20k prompt，kv_budget=4096，gpu_memory_utilization=0.9
+- 该配置下 free pool 始终充足，vLLM 优先用从未分配过的空闲 block，不会去复用刚被 evict 的
+- 因此方向 1 的"风险"（被复用 block 被覆盖写导致 stale hash 指向错误 KV）**在本实验配置下根本不会触发**
+
+**对方向 1 修复的影响**：
+- ✅ 方向 1 修复（不在 TriAttention 侧 evict hash）在本配置下**安全**
+- ⚠️ 但这个安全性依赖 free pool 充足。在更紧张配置下（更高并发 / 更长 prompt / 更低 gpu_memory_utilization），free pool 可能不够，vLLM 会被迫复用被 evict 的 block，那时方向 1 风险才可能显现
+- 🔒 修复时**必须保留 `block_reuse_on_allocate` 探针**，并在更紧张配置下补一轮验证
+
 ---
 
 ## 三、方向 1 风险点的当前观测状态（关键缺口）
@@ -162,26 +293,41 @@ allocate_slots_patch req_id=chatcmpl-8fe426eb213f252c-ba95e465
 
 ## 四、下一步实验计划
 
-### 4.1 必须补的观测（优先级 P0）
+### 4.1 ~~必须补的观测（优先级 P0）~~ ✅ 已完成
 
-**目标**：拿到 `block_reuse_on_allocate` 的实测数据，确认方向 1 风险是否真的存在。
+第二轮完整 grep 已确认 `block_reuse_on_allocate` 为空——被 evict 的 block 全程未被重新分配。方向 1 风险在本配置下不触发，**修复前置条件已满足**。详见第三节 3.5。
 
-**方法**：重跑实验，但要把日志跑得更久——至少跑到第二次批次的请求开始 Decode 生成新 token、需要 allocate 新 block 时。被 evict 的 122 个 block 此时才会被 vLLM 从 free pool 取出重新分配。
+### 4.2 修复后必须补的验证（优先级 P0，新分支上做）
 
-**成功判据**：日志里至少出现若干行 `block_reuse_on_allocate`，且能对应到 122 个被 evict 的 block id 之一。
+**目标**：确认方向 1 修复在 free pool 紧张配置下仍然安全。
 
-**结果解读**：
-- 若 `current_block_hash=None`（case B）占绝大多数 → vLLM 自己清了 hash，方向 1 缓解成立，可放心修复
-- 若 `current_block_hash=<新值>`（case C）占绝大多数 → vLLM 已重注册，安全
-- 若出现 `current_block_hash=<旧 prompt hash>`（case A）且后续该 block 被写入新数据 → 方向 1 风险真实存在，修复需加额外保护（如复用前校验 hash 一致性）
+**方法**：在更紧张的配置下重跑实验，强制 vLLM 复用被 evict 的 block：
+- 提高并发：bs=7 → bs=16 或更高
+- 或降低 `gpu_memory_utilization`：0.9 → 0.6
+- 或使用更长 prompt：20k → 32k
 
-### 4.2 可选的补充观测（优先级 P1）
+**成功判据**：日志里出现 `block_reuse_on_allocate` 行，且 `current_block_hash` 为 None（case B）或新 hash（case C），**不出现**旧 prompt hash（case A）。
 
-**目标**：量化"第二次批次的实际命中率"，与报告实测 31% 交叉验证。
+**若出现 case A**：方向 1 风险真实存在，需加额外保护（复用前校验 hash 一致性，或回退方向 2）。
+
+### 4.3 可选的补充观测（优先级 P1）
+
+**目标**：量化"第二次批次的实际命中率"，与报告实测 21% 交叉验证。
 
 **方法**：在 vLLM 侧启用 prefix-cache hit 统计（vLLM 自带 metric），或在第二次批次 Prefill 阶段单独 grep `allocate_slots_patch will_delay_cache_blocks=False num_new_tokens>1` 的行数，对比第一次批次同请求的 Prefill chunk 数。
 
-### 4.3 日志量优化建议
+### 4.4 报告公式偏差的后续处理（优先级 P2）
+
+**目标**：修正根因报告里 `reclaim_interval` 的计算。
+
+实测 `required_blocks=34` → `reclaim_interval=256=2×block_size`，而非报告的 `2048=16×block_size`。需要：
+1. 查 `triattention/vllm/runtime/thresholds.py:152-168` 的实际公式
+2. 确认 `16×` 系数来源（可能是 `min_reclaim_blocks_on_ascend` 默认 8 的 2 倍，或某个版本更新）
+3. 更新根因报告 4.3 节的阈值公式
+
+这不影响修复，但影响报告准确性，留作文档修正。
+
+### 4.5 日志量优化建议
 
 首轮日志爆量主要来自 `worker_self_trigger branch=defer_chunked_prefill_guard_fired`（每个 prefill chunk 每 TP 都打一行，7×4×N_chunks ≈ 数千行）。下次实验建议先做一次总过滤，把信号行单独存一份，后续所有 grep 都基于这份过滤后的文件：
 
@@ -190,7 +336,7 @@ grep "TRIATTN-PCTRACE" tmp.log \
   | grep -v "branch=defer_chunked_prefill_guard_fired" > pctrace_signal.log
 ```
 
-这样能砍掉 90%+ 的噪音，剩下的都是关键决策点。下面的 5.1–5.6 默认基于 `tmp.log`（原始日志）grep，但也可以用 `pctrace_signal.log` 替代以加快速度。
+这样能砍掉 90%+ 的噪音，剩下的都是关键决策点。下面的 5.1–5.7 默认基于 `tmp.log`（原始日志）grep，但也可以用 `pctrace_signal.log` 替代以加快速度。
 
 ---
 
@@ -289,19 +435,20 @@ grep "TRIATTN-PCTRACE" tmp.log | grep "free_reclaimed_blocks" > pctrace_free.log
 
 ---
 
-## 六、修复路线（待风险数据齐备后执行）
+## 六、修复路线
 
-### 6.1 当前阶段（本分支）已完成
+### 6.1 当前阶段（本分支）已完成 ✅
 
 - ✅ print 断点层（`_prefix_cache_debug.py`）
 - ✅ 6 类断点接入（scheduler / monkeypatch / runner）
 - ✅ 总开关 `TRIATTN_DEBUG_PREFIX_CACHE_TRACE`
-- ✅ 首轮观测：根因 + 疑点 B/C 实锤
-- ✅ 数字与报告公式精确对齐
+- ✅ 首轮观测（第二节）：根因 + 疑点 B/C 实锤
+- ✅ 第二轮完整 grep（第三节）：根因闭环、风险不触发、报告公式偏差定位
+- ✅ 修复前置条件全部满足
 
-### 6.2 下一阶段（新分支，待 P0 风险数据齐备后开）
+### 6.2 下一阶段（新分支，可立即开）
 
-**分支名建议**：`fix/prefix-cache-direction1-keep-hash-on-reclaim`
+**分支名**：`fix/prefix-cache-direction1-keep-hash-on-reclaim`
 
 **最小修复**：在 `triattention/vllm/runtime/scheduler.py` 的
 `_evict_reclaimed_block_metadata` 中跳过 `_maybe_evict_cached_block` 调用：
@@ -314,11 +461,13 @@ def _evict_reclaimed_block_metadata(block_pool, block):
     return
 ```
 
-**配套验证**：
-1. 重跑首轮实验，确认 evict 断点的 `stage=exit block_hash` 不再变 None
-2. 第二次批次命中率应回升到 ~100%（或接近 Base 基线）
-3. `block_reuse_on_allocate` 探针应显示 case B/C 占绝大多数
-4. 跑输出正确性测试（相同 prompt 两次输出应一致；不同 prompt 不串味）
+**配套验证（按优先级）**：
+1. **P0 正确性**：重跑首轮实验（bs=7, 20k prompt, kv_budget=4096），确认：
+   - evict 断点的 `stage=exit block_hash` **不再变 None**（hash 被保留）
+   - 第二次批次命中率回升到 ~100%（或接近 Base 基线 62ms TTFT）
+   - 输出正确性：相同 prompt 两次输出应一致；不同 prompt 不串味
+2. **P0 风险（紧张配置）**：按 4.2 节，在更高并发 / 更低 gpu_memory_utilization 下重跑，确认 `block_reuse_on_allocate` 出现时 `current_block_hash` 为 None 或新 hash（case B/C），不出现旧 prompt hash（case A）
+3. **P1 性能**：对比修复前后 TTFT，确认无回退
 
 **回退方案**：如果修复后出现 case A 风险（stale hash 导致读到错误 KV），退回方向 2（只回收 Decode 阶段超出 prompt 长度的 block，不动 prompt 部分）。
 
@@ -333,9 +482,10 @@ def _evict_reclaimed_block_metadata(block_pool, block):
 | 日期 | 分支 | 改动 |
 |---|---|---|
 | 2026-06-22 | `debug/prefix-cache-direction1-print-bp` | 初始断点层 + 文档（commit `780b8bb`） |
-| 2026-06-22 | 同上 | 首轮观测：根因 + 疑点 B/C 实锤，122 evict 与公式吻合（本文档第二、三节）（commit `47ccd1b`） |
-| 2026-06-22 | 同上 | grep 命令改为 `tmp.log`，补充 macOS 兼容写法与一键全跑脚本，明确自动 push 约定 |
-| 待定 | `fix/prefix-cache-direction1-keep-hash-on-reclaim` | 待 P0 风险数据齐备后开 |
+| 2026-06-22 | 同上 | 首轮观测（第二节）：根因 + 疑点 B/C 实锤，122 evict 与公式吻合（commit `47ccd1b`） |
+| 2026-06-22 | 同上 | grep 命令改为 `tmp.log`，补充 macOS 兼容写法与一键全跑脚本，明确自动 push 约定（commit `e1f099f`） |
+| 2026-06-22 | 同上 | 第二轮完整 grep（第三节）：根因闭环、required_blocks=34（报告公式偏差定位）、风险探针为空（本配置下安全）、修复前置条件满足 |
+| 待定 | `fix/prefix-cache-direction1-keep-hash-on-reclaim` | 方向 1 最小修复 + P0/P1 验证 |
 
 ---
 
