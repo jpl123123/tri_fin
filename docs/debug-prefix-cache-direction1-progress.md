@@ -24,6 +24,10 @@
   vLLM 重新分配。**这是下一步必须补的数据**，决定方向 1 修复是否需要额外
   保护。
 
+> **协作约定**：每次改完文档/代码后**自动 push** 到
+> `origin/debug/prefix-cache-direction1-print-bp`，无需额外确认。日志文件名
+> 固定为 `tmp.log`，grep 命令按第五节执行后把 `pctrace_*.log` 贴回 chat。
+
 ---
 
 ## 一、实验设置（首轮观测，2026-06-22）
@@ -179,26 +183,37 @@ allocate_slots_patch req_id=chatcmpl-8fe426eb213f252c-ba95e465
 
 ### 4.3 日志量优化建议
 
-首轮日志爆量主要来自 `worker_self_trigger branch=defer_chunked_prefill_guard_fired`（每个 prefill chunk 每 TP 都打一行，7×4×N_chunks ≈ 数千行）。下次实验建议直接在 grep 阶段过滤：
+首轮日志爆量主要来自 `worker_self_trigger branch=defer_chunked_prefill_guard_fired`（每个 prefill chunk 每 TP 都打一行，7×4×N_chunks ≈ 数千行）。下次实验建议先做一次总过滤，把信号行单独存一份，后续所有 grep 都基于这份过滤后的文件：
 
 ```bash
-grep "TRIATTN-PCTRACE" <log> | grep -v "branch=defer_chunked_prefill_guard_fired" > pctrace_signal.log
+grep "TRIATTN-PCTRACE" tmp.log \
+  | grep -v "branch=defer_chunked_prefill_guard_fired" > pctrace_signal.log
 ```
 
-这样能砍掉 90%+ 的噪音，剩下的都是关键决策点。
+这样能砍掉 90%+ 的噪音，剩下的都是关键决策点。下面的 5.1–5.6 默认基于 `tmp.log`（原始日志）grep，但也可以用 `pctrace_signal.log` 替代以加快速度。
 
 ---
 
 ## 五、下次实验要 grep 的内容（按优先级）
 
-> 每组单独存一个文件，便于交叉对照。
+> 日志文件名固定为 `tmp.log`。每组单独存一个文件，便于交叉对照。
+>
+> macOS 自带 `grep` 不支持 `-P`（PCRE），下面涉及 `-oP` 的命令在 macOS 上需用
+> `rg -o` 或 `ggrep -oP`（`brew install grep` 后可用）替代；下面同时给出 macOS
+> 兼容写法。
 
 ### 5.1 evict 总量分布（P0，根因严重度）
 
 ```bash
-grep "TRIATTN-PCTRACE" <log> \
+# Linux / GNU grep
+grep "TRIATTN-PCTRACE" tmp.log \
   | grep "free_reclaimed_blocks stage=post_evict_pre_free" \
   | grep -oP "n=\d+" | sort | uniq -c
+
+# macOS 兼容（用 rg）
+rg "TRIATTN-PCTRACE" tmp.log \
+  | rg "free_reclaimed_blocks stage=post_evict_pre_free" \
+  | rg -o "n=\d+" | sort | uniq -c
 ```
 
 每行是一个 reclaim 批次的 freed 数。预期第一次和第二次批次各出现 7 次（每请求一次），每次 n ≈ 100–130。
@@ -206,7 +221,7 @@ grep "TRIATTN-PCTRACE" <log> \
 ### 5.2 每请求 freed/kept 明细（P0，核对报告公式）
 
 ```bash
-grep "TRIATTN-PCTRACE" <log> | grep "reclaim_branch" > reclaim_branches.log
+grep "TRIATTN-PCTRACE" tmp.log | grep "reclaim_branch" > reclaim_branches.log
 ```
 
 每行带 `req_id gid branch freed= kept= required_blocks=`，可直接核对 `freed ≈ ceil(prefill_len/128) - 48`。
@@ -214,7 +229,7 @@ grep "TRIATTN-PCTRACE" <log> | grep "reclaim_branch" > reclaim_branches.log
 ### 5.3 压缩触发时机（P1，复核疑点 C）
 
 ```bash
-grep "TRIATTN-PCTRACE" <log> | grep "worker_self_trigger" \
+grep "TRIATTN-PCTRACE" tmp.log | grep "worker_self_trigger" \
   | grep -v "branch=defer_chunked_prefill_guard_fired" > self_trigger_decisions.log
 ```
 
@@ -223,7 +238,7 @@ grep "TRIATTN-PCTRACE" <log> | grep "worker_self_trigger" \
 ### 5.4 hash 提交情况（P1，疑点 B + 命中验证）
 
 ```bash
-grep "TRIATTN-PCTRACE" <log> | grep "allocate_slots_patch" \
+grep "TRIATTN-PCTRACE" tmp.log | grep "allocate_slots_patch" \
   | grep "will_delay_cache_blocks=True" > delay_cache_blocks.log
 ```
 
@@ -232,7 +247,7 @@ grep "TRIATTN-PCTRACE" <log> | grep "allocate_slots_patch" \
 ### 5.5 方向 1 风险探针（P0，关键缺口）
 
 ```bash
-grep "TRIATTN-PCTRACE" <log> | grep "block_reuse_on_allocate" > block_reuse.log
+grep "TRIATTN-PCTRACE" tmp.log | grep "block_reuse_on_allocate" > block_reuse.log
 ```
 
 **如果完全为空**：被 evict 的 block 没被重新分配，方向 1 风险在本实验不触发，可以放心做修复。
@@ -247,10 +262,30 @@ grep "TRIATTN-PCTRACE" <log> | grep "block_reuse_on_allocate" > block_reuse.log
 两次批次的 request_id 不同。先 grep 出所有 req_id：
 
 ```bash
-grep "TRIATTN-PCTRACE" <log> | grep -oP "req_id=chatcmpl-[a-f0-9]+" | sort -u
+# Linux / GNU grep
+grep "TRIATTN-PCTRACE" tmp.log | grep -oP "req_id=chatcmpl-[a-f0-9]+" | sort -u
+
+# macOS 兼容（用 rg）
+rg "TRIATTN-PCTRACE" tmp.log | rg -o "req_id=chatcmpl-[a-f0-9]+" | sort -u
 ```
 
 拿到 14 个 req_id（7×2）后，按 warmup 结束时间为界分两组。或直接按 `chatcmpl-` 后缀前 8 位分组。
+
+### 5.7 一键全跑（可选）
+
+把上面 5.1–5.5 一次性产出到 `pctrace_*.log` 文件：
+
+```bash
+grep "TRIATTN-PCTRACE" tmp.log | grep -v "branch=defer_chunked_prefill_guard_fired" > pctrace_signal.log
+grep "TRIATTN-PCTRACE" tmp.log | grep "reclaim_branch" > pctrace_reclaim_branches.log
+grep "TRIATTN-PCTRACE" tmp.log | grep "worker_self_trigger" | grep -v "branch=defer_chunked_prefill_guard_fired" > pctrace_self_trigger.log
+grep "TRIATTN-PCTRACE" tmp.log | grep "allocate_slots_patch" > pctrace_allocate_slots.log
+grep "TRIATTN-PCTRACE" tmp.log | grep "block_reuse_on_allocate" > pctrace_block_reuse.log
+grep "TRIATTN-PCTRACE" tmp.log | grep "evict_reclaimed_block" > pctrace_evict.log
+grep "TRIATTN-PCTRACE" tmp.log | grep "free_reclaimed_blocks" > pctrace_free.log
+```
+
+跑完把 `pctrace_*.log` 全部贴回 chat 即可，我会按优先级分析。
 
 ---
 
@@ -298,7 +333,8 @@ def _evict_reclaimed_block_metadata(block_pool, block):
 | 日期 | 分支 | 改动 |
 |---|---|---|
 | 2026-06-22 | `debug/prefix-cache-direction1-print-bp` | 初始断点层 + 文档（commit `780b8bb`） |
-| 2026-06-22 | 同上 | 首轮观测：根因 + 疑点 B/C 实锤，122 evict 与公式吻合（本文档第二、三节） |
+| 2026-06-22 | 同上 | 首轮观测：根因 + 疑点 B/C 实锤，122 evict 与公式吻合（本文档第二、三节）（commit `47ccd1b`） |
+| 2026-06-22 | 同上 | grep 命令改为 `tmp.log`，补充 macOS 兼容写法与一键全跑脚本，明确自动 push 约定 |
 | 待定 | `fix/prefix-cache-direction1-keep-hash-on-reclaim` | 待 P0 风险数据齐备后开 |
 
 ---
