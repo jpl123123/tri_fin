@@ -36,6 +36,13 @@ from .worker import (
     should_install_triattention_runner_proxy,
 )
 
+# Print-breakpoint helpers for the Prefix-Caching investigation (Direction 1).
+# These calls are no-ops when TRIATTN_DEBUG_PREFIX_CACHE_TRACE is unset/0.
+from ._prefix_cache_debug import (  # noqa: E402
+    trace_allocate_slots_patch as _pctrace_alloc,
+    trace_block_reuse_on_allocate as _pctrace_reuse,
+)
+
 _PATCHED = False
 _PATCHED_SCHEDULER_ACTIVE = False
 _PATCHED_WORKER_ACTIVE = False
@@ -517,27 +524,120 @@ def _patched_kv_cache_allocate_slots(
     prepare_request_effective_num_computed(request)
     effective_num_computed = resolve_request_effective_num_computed(request)
     if effective_num_computed is None:
-        return _ORIG_KVCACHE_ALLOCATE_SLOTS(
+        # [PCTRACE] no effective override — vLLM will cache-commit normally.
+        _pctrace_alloc(
+            request=request, num_new_tokens=num_new_tokens,
+            effective_num_computed=None,
+            logical_num_computed=getattr(request, "num_computed_tokens", None),
+            will_delay_cache_blocks=False,
+        )
+        result = _ORIG_KVCACHE_ALLOCATE_SLOTS(
             self, request, num_new_tokens, *args, **kwargs,
         )
+        # [PCTRACE] risk probe: detect if any newly-allocated block id was
+        # previously freed by TriAttention reclaim, and print its current
+        # block_hash so we can tell whether vLLM cleared/refreshed it.
+        _pctrace_maybe_trace_reuse(self, request, result)
+        return result
     logical_num_computed = getattr(request, "num_computed_tokens", None)
     if not isinstance(logical_num_computed, int):
-        return _ORIG_KVCACHE_ALLOCATE_SLOTS(
+        _pctrace_alloc(
+            request=request, num_new_tokens=num_new_tokens,
+            effective_num_computed=effective_num_computed,
+            logical_num_computed=logical_num_computed,
+            will_delay_cache_blocks=False,
+        )
+        result = _ORIG_KVCACHE_ALLOCATE_SLOTS(
             self, request, num_new_tokens, *args, **kwargs,
         )
+        _pctrace_maybe_trace_reuse(self, request, result)
+        return result
     if effective_num_computed >= logical_num_computed:
-        return _ORIG_KVCACHE_ALLOCATE_SLOTS(
+        _pctrace_alloc(
+            request=request, num_new_tokens=num_new_tokens,
+            effective_num_computed=effective_num_computed,
+            logical_num_computed=logical_num_computed,
+            will_delay_cache_blocks=False,
+        )
+        result = _ORIG_KVCACHE_ALLOCATE_SLOTS(
             self, request, num_new_tokens, *args, **kwargs,
         )
+        _pctrace_maybe_trace_reuse(self, request, result)
+        return result
+    # [PCTRACE] Suspect B: this request has been compressed before, so the
+    # patch will set delay_cache_blocks=True and skip prefix-cache hash
+    # commit for any newly-filled blocks on this step.
+    _pctrace_alloc(
+        request=request, num_new_tokens=num_new_tokens,
+        effective_num_computed=effective_num_computed,
+        logical_num_computed=logical_num_computed,
+        will_delay_cache_blocks=True,
+    )
     kwargs = dict(kwargs)
     kwargs["delay_cache_blocks"] = True
     setattr(request, "num_computed_tokens", int(effective_num_computed))
     try:
-        return _ORIG_KVCACHE_ALLOCATE_SLOTS(
+        result = _ORIG_KVCACHE_ALLOCATE_SLOTS(
             self, request, num_new_tokens, *args, **kwargs,
         )
     finally:
         setattr(request, "num_computed_tokens", logical_num_computed)
+    # [PCTRACE] risk probe: even on the delay-cache-blocks path, vLLM may
+    # allocate fresh physical blocks whose ids were previously freed by
+    # TriAttention reclaim.  Print their current block_hash so we can tell
+    # whether vLLM cleared/refreshed them.
+    _pctrace_maybe_trace_reuse(self, request, result)
+    return result
+
+
+def _pctrace_maybe_trace_reuse(manager: Any, request: Any, result: Any) -> None:
+    """Best-effort: extract new block ids from allocate_slots result and run
+    the reuse risk probe.
+
+    vLLM's ``KVCacheManager.allocate_slots`` returns a list of block ids (the
+    "external block ids" newly allocated or reused for this request).  We try
+    several shapes because vLLM versions differ slightly.  Any failure here is
+    swallowed — the debug trace must never break the real allocation path.
+    """
+    try:
+        new_block_ids: list[Any] = []
+        if isinstance(result, list):
+            new_block_ids = [b for b in result if isinstance(b, int)]
+        elif isinstance(result, dict):
+            for v in result.values():
+                if isinstance(v, list):
+                    new_block_ids.extend(
+                        b for b in v if isinstance(b, int)
+                    )
+        if not new_block_ids:
+            return
+        # Resolve the actual Block objects so we can read their block_hash.
+        block_pool = getattr(manager, "block_pool", None)
+        blocks: list[Any] = []
+        if block_pool is not None:
+            # BlockPool typically exposes block_id -> Block via several attrs.
+            for attr_name in ("blocks", "_blocks", "block_table"):
+                tbl = getattr(block_pool, attr_name, None)
+                if isinstance(tbl, (list, dict)):
+                    if isinstance(tbl, list):
+                        for bid in new_block_ids:
+                            if 0 <= bid < len(tbl):
+                                blocks.append(tbl[bid])
+                        if blocks:
+                            break
+                    else:  # dict
+                        for bid in new_block_ids:
+                            b = tbl.get(bid)
+                            if b is not None:
+                                blocks.append(b)
+                        if blocks:
+                            break
+        _pctrace_reuse(
+            request=request, new_block_ids=new_block_ids, blocks=blocks,
+        )
+    except Exception:
+        # Never let the debug probe disturb the real allocation path.
+        return
 
 
 def _scheduler_output_has_compression_boundary(scheduler_output: Any) -> bool:

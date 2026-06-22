@@ -47,6 +47,12 @@ from .thresholds import (
 )
 from .worker_reclaim_sync import apply_worker_block_reclaim_events
 
+# Print-breakpoint helpers for the Prefix-Caching investigation (Direction 1).
+# These calls are no-ops when TRIATTN_DEBUG_PREFIX_CACHE_TRACE is unset/0.
+from ._prefix_cache_debug import (  # noqa: E402
+    trace_worker_self_trigger as _pctrace_self_trigger,
+)
+
 
 def _env_bool(name: str, default: bool) -> bool:
     raw = os.environ.get(name)
@@ -722,6 +728,18 @@ class TriAttentionModelRunner:
                 num_computed_tokens=num_computed_tokens,
             )
             if defer_chunked_prefill and is_prefill_step_for_threshold:
+                # [PCTRACE] Suspect C observation: this guard is the one that
+                # stops being true right after prefill ends.  When it fires
+                # (True here) we drop/skip the trigger; when it stops firing
+                # we fall through to the threshold check below.
+                _pctrace_self_trigger(
+                    req_id=req_id, scheduled_tokens=scheduled_tokens_i,
+                    existing_estimate=existing_estimate, prefill_len=prefill_len,
+                    threshold=None,
+                    is_prefill_step_for_threshold=True,
+                    defer_chunked_prefill=True, will_compress=False,
+                    extra="branch=defer_chunked_prefill_guard_fired",
+                )
                 if existing is not None and existing.should_compress:
                     signals.pop(req_id, None)
                     if hasattr(self.state_store, "mark_compression_skipped"):
@@ -874,6 +892,20 @@ class TriAttentionModelRunner:
                 )
                 continue
             if effective_kv < threshold and not physical_capacity_boundary_hit:
+                # [PCTRACE] below worker threshold — no self-trigger.
+                _pctrace_self_trigger(
+                    req_id=req_id, scheduled_tokens=scheduled_tokens_i,
+                    existing_estimate=existing_estimate, prefill_len=prefill_len,
+                    threshold=threshold,
+                    is_prefill_step_for_threshold=is_prefill_step_for_threshold,
+                    defer_chunked_prefill=defer_chunked_prefill,
+                    will_compress=False,
+                    extra=(
+                        f"branch=below_threshold effective_kv={effective_kv} "
+                        f"actual_kv={actual_kv} from_blocks={kv_from_blocks} "
+                        f"physical_capacity_boundary_hit={physical_capacity_boundary_hit}"
+                    ),
+                )
                 if existing is not None and existing.should_compress:
                     signals.pop(req_id, None)
                     if hasattr(self.state_store, "mark_compression_skipped"):
@@ -921,7 +953,45 @@ class TriAttentionModelRunner:
                 and existing.should_compress
                 and int(getattr(existing, "scheduled_tokens", 1)) <= 1
             ):
+                # [PCTRACE] scheduler already had a 1-token (decode) trigger;
+                # worker keeps it as-is — no new self-trigger.
+                _pctrace_self_trigger(
+                    req_id=req_id, scheduled_tokens=scheduled_tokens_i,
+                    existing_estimate=existing_estimate, prefill_len=prefill_len,
+                    threshold=threshold,
+                    is_prefill_step_for_threshold=is_prefill_step_for_threshold,
+                    defer_chunked_prefill=defer_chunked_prefill,
+                    will_compress=True,
+                    extra=(
+                        f"branch=keep_scheduler_decode_trigger "
+                        f"effective_kv={effective_kv} actual_kv={actual_kv} "
+                        f"from_blocks={kv_from_blocks} "
+                        f"physical_capacity_boundary_hit={physical_capacity_boundary_hit}"
+                    ),
+                )
                 continue
+            # [PCTRACE] Suspect C smoking gun: worker self-triggers a
+            # compression signal here.  On the first decode step right after
+            # prefill, defer_chunked_prefill guard has stopped firing (because
+            # is_prefill_step_for_threshold is now False — scheduled_tokens==1
+            # AND existing_estimate >= prefill_len), and effective_kv (≈20000)
+            # is well above the decode threshold (≈6144).  This is the trigger
+            # that leads to the prompt-mid/tail block reclaim + evict.
+            _pctrace_self_trigger(
+                req_id=req_id, scheduled_tokens=scheduled_tokens_i,
+                existing_estimate=existing_estimate, prefill_len=prefill_len,
+                threshold=threshold,
+                is_prefill_step_for_threshold=is_prefill_step_for_threshold,
+                defer_chunked_prefill=defer_chunked_prefill,
+                will_compress=True,
+                extra=(
+                    f"branch=worker_self_trigger_fired "
+                    f"effective_kv={effective_kv} actual_kv={actual_kv} "
+                    f"from_blocks={kv_from_blocks} "
+                    f"physical_capacity_boundary_hit={physical_capacity_boundary_hit} "
+                    f"scheduler_had_signal={bool(existing)}"
+                ),
+            )
             if self.config.log_decisions:
                 self._logger.info(
                     "TriAttention worker self-trigger: req=%s actual_kv=%d "

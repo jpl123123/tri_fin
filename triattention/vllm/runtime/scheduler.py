@@ -33,6 +33,21 @@ from .thresholds import (
 )
 from .version import RUNTIME_BUILD_ID
 
+# Print-breakpoint helpers for the Prefix-Caching investigation (Direction 1).
+# These calls are no-ops when TRIATTN_DEBUG_PREFIX_CACHE_TRACE is unset/0.
+from ._prefix_cache_debug import (  # noqa: E402
+    announce_active as _pctrace_announce_active,
+    record_freed_block_ids as _pctrace_record_freed_block_ids,
+    trace_evict_reclaimed_block as _pctrace_evict,
+    trace_free_reclaimed_blocks as _pctrace_free,
+    trace_reclaim_branch as _pctrace_branch,
+)
+
+# Announce once per process that the debug layer is armed.  No-op when the
+# master switch is off, so this is safe to leave in place.
+_pctrace_announce_active()
+
+
 def _evict_reclaimed_block_metadata(block_pool: Any, block: Any) -> None:
     """Best-effort clear of prefix-cache metadata before reusing a block."""
     if block_pool is None or block is None:
@@ -41,9 +56,17 @@ def _evict_reclaimed_block_metadata(block_pool: Any, block: Any) -> None:
     if block_hash is None:
         return
 
+    # [PCTRACE] observe the block BEFORE the evict — this is the hash that
+    # Direction 1 proposes to KEEP.  No-op when switch is off.
+    _pctrace_evict(block_pool=block_pool, block=block, stage="enter")
+
     maybe_evict = getattr(block_pool, "_maybe_evict_cached_block", None)
     if callable(maybe_evict):
         maybe_evict(block)
+
+    # [PCTRACE] observe the block AFTER the evict — under current behavior the
+    # block_hash should now be None / removed from cached_block.
+    _pctrace_evict(block_pool=block_pool, block=block, stage="exit")
 
 
 def _free_reclaimed_blocks(manager: Any, removed_blocks: list[Any]) -> bool:
@@ -51,11 +74,32 @@ def _free_reclaimed_blocks(manager: Any, removed_blocks: list[Any]) -> bool:
     if not removed_blocks:
         return False
     block_pool = getattr(manager, "block_pool", None)
+
+    # [PCTRACE] snapshot the block ids + hashes BEFORE the per-block evict loop.
+    _pctrace_free(manager=manager, removed_blocks=removed_blocks, stage="pre_evict")
+
     for block in removed_blocks:
         _evict_reclaimed_block_metadata(block_pool, block)
+
+    # [PCTRACE] after the evict loop, before free_blocks — under current
+    # behavior every block_hash should now be None.
+    _pctrace_free(
+        manager=manager, removed_blocks=removed_blocks, stage="post_evict_pre_free"
+    )
+
     if block_pool is None:
         return False
     block_pool.free_blocks(reversed(removed_blocks))
+
+    # [PCTRACE] after free_blocks — record the freed ids so we can later detect
+    # when vLLM re-allocates one of them for a different request (Direction-1
+    # risk probe).  Also emit a post-free snapshot.
+    _pctrace_free(
+        manager=manager, removed_blocks=removed_blocks, stage="post_free"
+    )
+    _pctrace_record_freed_block_ids(
+        [getattr(b, "block_id", None) for b in removed_blocks]
+    )
     return True
 
 
@@ -705,6 +749,14 @@ class TriAttentionScheduler(Scheduler):
                             "scheduled_tokens=%d) req=%s",
                             _evt_scheduled, req_id,
                         )
+                    # [PCTRACE] reclaim skipped during chunked prefill — no
+                    # blocks freed on this branch, but record it so we can see
+                    # the timing of the *next* branch that does free.
+                    _pctrace_branch(
+                        req_id=req_id, gid=-1, branch="skip_prefill_no_groups",
+                        freed_count=0, kept_count=-1, required_blocks=required_blocks,
+                        extra=f"scheduled_tokens={_evt_scheduled}",
+                    )
                 elif expected_shrink_gids and isinstance(managers, (list, tuple)):
                     for gid in sorted(expected_shrink_gids):
                         manager = managers[gid]
@@ -719,6 +771,16 @@ class TriAttentionScheduler(Scheduler):
                                 manager.num_cached_block[req_id],
                                 len(kept_blocks),
                             )
+                        # [PCTRACE] synthesized reclaim (no groups payload) —
+                        # this is the branch that fires on the first decode
+                        # step right after prefill in the report's repro.
+                        _pctrace_branch(
+                            req_id=req_id, gid=gid, branch="synthesize_no_groups",
+                            freed_count=len(removed_blocks),
+                            kept_count=len(kept_blocks),
+                            required_blocks=required_blocks,
+                            extra=f"reclaim_mode={reclaim_mode}",
+                        )
                         if _free_reclaimed_blocks(manager, removed_blocks):
                             reclaim_applied_any = True
                 if reclaim_applied_any:
@@ -853,6 +915,16 @@ class TriAttentionScheduler(Scheduler):
                             req_id, gid, len(removed_old_blocks),
                             len(kept_old_blocks), len(new_blocks_this_step),
                         )
+                    # [PCTRACE] explicit block_reclaim.groups payload — this is
+                    # the worker-driven reclaim path.
+                    _pctrace_branch(
+                        req_id=req_id, gid=gid, branch="explicit_groups",
+                        freed_count=len(removed_old_blocks),
+                        kept_count=len(kept_old_blocks),
+                        new_count=len(new_blocks_this_step),
+                        required_blocks=required_blocks,
+                        extra=f"reclaim_mode={reclaim_mode}",
+                    )
                     if _free_reclaimed_blocks(manager, removed_old_blocks):
                         reclaim_applied_any = True
 
@@ -878,6 +950,15 @@ class TriAttentionScheduler(Scheduler):
                             manager.num_cached_block[req_id],
                             len(kept_blocks),
                         )
+                    # [PCTRACE] synthesized reclaim for gids missing from the
+                    # explicit groups payload (V1 batch-queue race).
+                    _pctrace_branch(
+                        req_id=req_id, gid=gid, branch="synthesize_missing_gids",
+                        freed_count=len(removed_blocks),
+                        kept_count=len(kept_blocks),
+                        required_blocks=required_blocks,
+                        extra=f"reclaim_mode={reclaim_mode}",
+                    )
                     if _free_reclaimed_blocks(manager, removed_blocks):
                         reclaim_applied_any = True
             elif missing_gids and _evt_scheduled > 1:
@@ -888,6 +969,14 @@ class TriAttentionScheduler(Scheduler):
                         "(scheduled_tokens=%d) req=%s",
                         sorted(missing_gids), _evt_scheduled, req_id,
                     )
+                # [PCTRACE] reclaim skipped during chunked prefill for missing
+                # gids — no blocks freed on this branch.
+                _pctrace_branch(
+                    req_id=req_id, gid=-1, branch="skip_prefill_missing_gids",
+                    freed_count=0, kept_count=-1, required_blocks=required_blocks,
+                    extra=f"scheduled_tokens={_evt_scheduled} "
+                          f"missing_gids={sorted(missing_gids)}",
+                )
 
             if reclaim_applied_any:
                 update_request_effective_kv_offset(
