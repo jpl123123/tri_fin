@@ -42,6 +42,12 @@ from ._prefix_cache_debug import (  # noqa: E402
     trace_allocate_slots_patch as _pctrace_alloc,
     trace_block_reuse_on_allocate as _pctrace_reuse,
 )
+# Path C: block hash-protection helpers used by the patched
+# BlockPool._maybe_evict_cached_block to skip lazy evict on protected blocks.
+from .scheduler import (  # noqa: E402
+    _clear_block_hash_protection as _pctrace_clear_protection,
+    _is_block_hash_protected as _pctrace_is_protected,
+)
 
 _PATCHED = False
 _PATCHED_SCHEDULER_ACTIVE = False
@@ -56,6 +62,7 @@ _ORIG_ASCEND_SET_FORWARD_CONTEXT: Callable[..., Any] | None = None
 _ORIG_ASCEND_MODEL_RUNNER_SET_FORWARD_CONTEXT: Callable[..., Any] | None = None
 _ORIG_KVCACHE_ALLOCATE_SLOTS: Callable[..., Any] | None = None
 _ORIG_ENGINE_CORE_STEP_WITH_BATCH_QUEUE: Callable[..., Any] | None = None
+_ORIG_MAYBE_EVICT_CACHED_BLOCK: Callable[..., Any] | None = None
 _DEFER_PREFILL_BOUNDARY_CACHE: bool | None = None
 _ASYNC_BOUNDARY_ENABLED_CACHE: bool | None = None
 
@@ -640,6 +647,30 @@ def _pctrace_maybe_trace_reuse(manager: Any, request: Any, result: Any) -> None:
         return
 
 
+def _patched_maybe_evict_cached_block(self: Any, block: Any) -> Any:
+    """Path C: skip lazy evict for TriAttention hash-protected blocks.
+
+    vLLM's ``BlockPool._maybe_evict_cached_block`` is called from
+    ``get_new_blocks`` whenever a block is reused from the free pool.  For
+    blocks marked with ``_triattention_hash_protected`` (set by
+    ``_free_reclaimed_blocks`` during TriAttention compression reclaim), we
+    skip the evict so the block's prefix-cache hash stays in
+    ``cached_block`` and the next identical request can match it.
+
+    Once a protected block is reused for new content, vLLM registers a fresh
+    hash for it (overwriting the old one).  We clear the protection flag at
+    that point so subsequent evicts behave normally.  Skipping evict on a
+    freshly-registered hash is harmless (it just keeps the correct new hash
+    alive a bit longer).
+    """
+    if _pctrace_is_protected(block):
+        # Clear protection so the block behaves normally on subsequent reuse.
+        _pctrace_clear_protection(block)
+        return None
+    assert _ORIG_MAYBE_EVICT_CACHED_BLOCK is not None
+    return _ORIG_MAYBE_EVICT_CACHED_BLOCK(self, block)
+
+
 def _scheduler_output_has_compression_boundary(scheduler_output: Any) -> bool:
     if not _async_compression_boundary_enabled():
         return False
@@ -798,6 +829,7 @@ def install_vllm_integration_monkeypatches(
     global _PATCHED, _ORIG_SCHED_INIT, _ORIG_SCHED_SCHEDULE, _ORIG_SCHED_UPDATE_FROM_OUTPUT
     global _ORIG_WORKER_INIT_DEVICE, _ORIG_WORKER_EXECUTE_MODEL
     global _ORIG_KVCACHE_ALLOCATE_SLOTS, _ORIG_ENGINE_CORE_STEP_WITH_BATCH_QUEUE
+    global _ORIG_MAYBE_EVICT_CACHED_BLOCK
     global _PATCHED_SCHEDULER_ACTIVE, _PATCHED_WORKER_ACTIVE
     if _PATCHED:
         if patch_worker and not _PATCHED_WORKER_ACTIVE:
@@ -848,6 +880,28 @@ def install_vllm_integration_monkeypatches(
         KVCacheManager.allocate_slots = _patched_kv_cache_allocate_slots
         _ORIG_ENGINE_CORE_STEP_WITH_BATCH_QUEUE = EngineCore.step_with_batch_queue
         EngineCore.step_with_batch_queue = _patched_engine_core_step_with_batch_queue
+
+        # Path C: patch BlockPool._maybe_evict_cached_block to skip lazy evict
+        # on TriAttention hash-protected blocks, so their prefix-cache hash
+        # survives in cached_block for the next identical request to match.
+        try:
+            from vllm.v1.core.block_pool import BlockPool as _V1BlockPool
+            _ORIG_MAYBE_EVICT_CACHED_BLOCK = _V1BlockPool._maybe_evict_cached_block
+            _V1BlockPool._maybe_evict_cached_block = _patched_maybe_evict_cached_block
+            if runtime_logging_enabled():
+                logger.info(
+                    "TriAttention Path-C: patched BlockPool._maybe_evict_cached_block "
+                    "to skip lazy evict on hash-protected blocks"
+                )
+        except (ImportError, AttributeError) as _e:
+            _ORIG_MAYBE_EVICT_CACHED_BLOCK = None
+            if runtime_logging_enabled():
+                logger.warning(
+                    "TriAttention Path-C: could not patch "
+                    "BlockPool._maybe_evict_cached_block (%s); "
+                    "hash protection inactive, falling back to default evict",
+                    _e,
+                )
 
     if patch_worker:
         _install_worker_patches(Worker)

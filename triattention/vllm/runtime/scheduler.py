@@ -114,26 +114,32 @@ def _evict_reclaimed_block_metadata(block_pool: Any, block: Any) -> None:
 def _free_reclaimed_blocks(manager: Any, removed_blocks: list[Any]) -> bool:
     """Free reclaimed tail blocks after clearing any stale prefix-cache identity.
 
-    Path A (Direction-1 full fix): when ``keep_prefix_cache_hash_on_reclaim``
-    is True, the reclaimed blocks are **not** returned to the free pool.
-    Instead they are registered on ``manager._triattention_pinned_blocks`` so
-    that:
+    Path C (Direction-1 memory-efficient fix): when
+    ``keep_prefix_cache_hash_on_reclaim`` is True, the reclaimed blocks are
+    returned to the free pool **with their prefix-cache hash protected** from
+    vLLM's lazy eviction.  Concretely each removed block is marked with
+    ``_triattention_hash_protected`` so that the patched
+    ``BlockPool._maybe_evict_cached_block`` skips its hash cleanup when vLLM
+    later reuses the block from the free pool.
 
-      - their ``ref_cnt`` stays > 0, so vLLM never reuses them (and thus never
-        lazily evicts their prefix-cache hash via ``_maybe_evict_cached_block``
-        on allocate);
-      - their ``block_hash`` stays in ``BlockPool.cached_block`` so the next
-        identical request's ``_get_prompt_block_ids`` can match the full
-        prompt prefix → ~100% prefix-cache hit on the second request;
-      - they are released back to the free pool when the owning request
-        finishes (see ``_release_pinned_blocks_for_request``), at which point
-        evicting the hash is safe because the second request has either
-        already matched or no longer needs these hashes.
+    Effect chain:
+      - ``free_blocks`` returns the block to the free pool (``ref_cnt``→0),
+        so physical memory is reclaimed → KV usage stays near baseline (~21%
+        instead of Path A's 86%).
+      - The protected hash stays in ``cached_block`` so the next identical
+        request's ``_get_prompt_block_ids`` matches the full prompt prefix.
+      - On the second request's 100% hit, ``BlockPool.touch`` moves the block
+        out of the free queue (``ref_cnt`` 0→1) before any ``get_new_blocks``
+        call, so the protected block is never re-evicted.
+      - When the block is eventually reused for new content, vLLM registers a
+        fresh hash (overwriting the old one); the stale protection flag is
+        harmless because skipping evict on a freshly-registered hash only
+        keeps the (correct) new hash alive a bit longer.
 
     The TriAttention decode speedup is unaffected because the NPU attention
     kernel is constrained by ``seq_lens`` (rewritten by input_patch to
-    ``kv_budget``), so it never indexes the pinned tail blocks regardless of
-    their physical ref_cnt.
+    ``kv_budget``), so it never indexes the reclaimed tail blocks regardless
+    of their physical ``ref_cnt``.
     """
     if not removed_blocks:
         return False
@@ -142,29 +148,22 @@ def _free_reclaimed_blocks(manager: Any, removed_blocks: list[Any]) -> bool:
     # [PCTRACE] snapshot the block ids + hashes BEFORE the per-block evict loop.
     _pctrace_free(manager=manager, removed_blocks=removed_blocks, stage="pre_evict")
 
-    for block in removed_blocks:
-        _evict_reclaimed_block_metadata(block_pool, block)
+    if _keep_prefix_cache_hash_on_reclaim():
+        # Path C: protect the hash so vLLM's lazy evict skips it, but still
+        # physically free the block.  Do NOT call _evict_reclaimed_block_metadata
+        # here (that would clear the hash we want to keep).
+        for block in removed_blocks:
+            _mark_block_hash_protected(block)
+    else:
+        # Original behavior: clear hash via _maybe_evict_cached_block.
+        for block in removed_blocks:
+            _evict_reclaimed_block_metadata(block_pool, block)
 
-    # [PCTRACE] after the evict loop.  Under Path A the per-block evict is a
-    # no-op (hash kept), so every block_hash should still be non-None here.
+    # [PCTRACE] after the protect/evict loop.  Under Path C every block_hash
+    # should still be non-None (protected); under original behavior None.
     _pctrace_free(
         manager=manager, removed_blocks=removed_blocks, stage="post_evict_pre_free"
     )
-
-    if _keep_prefix_cache_hash_on_reclaim():
-        # Path A: pin the blocks instead of returning them to the free pool.
-        # They keep ref_cnt > 0 and their hash stays in cached_block, so the
-        # next identical request can hit the full prompt prefix.  Released
-        # later by _release_pinned_blocks_for_request when the request finishes.
-        pinned = getattr(manager, "_triattention_pinned_blocks", None)
-        if pinned is None:
-            pinned = []
-            setattr(manager, "_triattention_pinned_blocks", pinned)
-        pinned.extend(removed_blocks)
-        _pctrace_free(
-            manager=manager, removed_blocks=removed_blocks, stage="post_pin"
-        )
-        return True
 
     if block_pool is None:
         return False
@@ -182,46 +181,47 @@ def _free_reclaimed_blocks(manager: Any, removed_blocks: list[Any]) -> bool:
     return True
 
 
-def _release_pinned_blocks_for_request(manager: Any, req_id: Any) -> int:
-    """Release Path-A pinned blocks owned by a finished request back to free pool.
+# ---------------------------------------------------------------------------
+# Path C: block hash-protection markers
+# ---------------------------------------------------------------------------
 
-    Called when a request finishes.  At this point evicting the prefix-cache
-    hash is safe: the second identical request has either already matched
-    (and copied/touched the blocks it needs) or will not come.  Returning
-    the blocks to the free pool prevents the orphan-block leak that would
-    otherwise accumulate across requests.
+_TRIATTENTION_HASH_PROTECTED_ATTR = "_triattention_hash_protected"
 
-    Returns the number of blocks released.
+
+def _mark_block_hash_protected(block: Any) -> None:
+    """Mark a block so vLLM's lazy evict skips its hash cleanup.
+
+    The block is still returned to the free pool (``ref_cnt``=0), but its
+    prefix-cache hash stays in ``cached_block`` so the next identical request
+    can match it.  The protection is best-effort: if the block object refuses
+    the attribute set, we silently skip (correctness falls back to vLLM's
+    default lazy evict for that block).
     """
-    pinned = getattr(manager, "_triattention_pinned_blocks", None)
-    if not pinned:
-        return 0
-    block_pool = getattr(manager, "block_pool", None)
-    # Identify pinned blocks whose current owner is this request.  We use
-    # ``req_id`` linkage via the block's ``request`` attribute if present,
-    # otherwise fall back to releasing all pinned blocks for this manager
-    # (single-request-per-manager is the common V1 case for the tail blocks
-    # because each compression event owns its own removed_blocks list).
-    to_release: list[Any] = []
-    keep: list[Any] = []
-    for block in pinned:
-        owner = getattr(block, "request", None)
-        owner_id = getattr(owner, "request_id", None)
-        if owner_id is not None and owner_id == req_id:
-            to_release.append(block)
-        else:
-            keep.append(block)
-    if not to_release:
-        return 0
-    # Evict the hash now (safe — request is finished) before freeing, so the
-    # blocks re-enter the free pool with a clean state.
-    for block in to_release:
-        _evict_reclaimed_block_metadata(block_pool, block)
-    if block_pool is not None:
-        block_pool.free_blocks(reversed(to_release))
-    setattr(manager, "_triattention_pinned_blocks", keep)
-    _pctrace_free(manager=manager, removed_blocks=to_release, stage="post_release_pin")
-    return len(to_release)
+    if block is None:
+        return
+    try:
+        setattr(block, _TRIATTENTION_HASH_PROTECTED_ATTR, True)
+    except Exception:
+        pass
+
+
+def _is_block_hash_protected(block: Any) -> bool:
+    if block is None:
+        return False
+    return bool(getattr(block, _TRIATTENTION_HASH_PROTECTED_ATTR, False))
+
+
+def _clear_block_hash_protection(block: Any) -> None:
+    if block is None:
+        return
+    try:
+        if hasattr(block, _TRIATTENTION_HASH_PROTECTED_ATTR):
+            delattr(block, _TRIATTENTION_HASH_PROTECTED_ATTR)
+    except Exception:
+        try:
+            setattr(block, _TRIATTENTION_HASH_PROTECTED_ATTR, False)
+        except Exception:
+            pass
 
 
 def _resolve_full_prefill_len_from_request_like(request_like: Any) -> int:
@@ -1136,29 +1136,9 @@ class TriAttentionScheduler(Scheduler):
             self._prefill_compression_counts.pop(req_id, None)
             self._long_context_guard_logged.discard(req_id)
             self._effective_len_tracker.remove_request(req_id)
-            # Path A: release pinned (orphan) blocks back to the free pool now
-            # that this request has finished.  At this point evicting the
-            # prefix-cache hash is safe — the second identical request has
-            # either already matched these blocks or will not come.  This
-            # prevents the orphan-block leak that would otherwise accumulate
-            # across requests.
-            if _keep_prefix_cache_hash_on_reclaim():
-                coordinator = getattr(self.kv_cache_manager, "coordinator", None)
-                managers = getattr(coordinator, "single_type_managers", None)
-                if isinstance(managers, (list, tuple)):
-                    released_total = 0
-                    for manager in managers:
-                        try:
-                            released_total += _release_pinned_blocks_for_request(
-                                manager, req_id
-                            )
-                        except Exception:
-                            # Best-effort: never let pin-release break finishing.
-                            continue
-                    if released_total and self.triattention_config.log_decisions:
-                        logger.debug(
-                            "TriAttention Path-A released pinned blocks on "
-                            "finish: req=%s released=%d",
-                            req_id, released_total,
-                        )
+            # Path C: no per-request pin cleanup needed — blocks were already
+            # returned to the free pool by _free_reclaimed_blocks at reclaim
+            # time (with their hash protected from lazy evict).  Nothing to do
+            # here; vLLM's normal request-finish free handles the retained
+            # blocks (req_to_blocks[req_id]).
         return outputs
