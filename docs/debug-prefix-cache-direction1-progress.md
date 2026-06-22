@@ -27,11 +27,17 @@
 - **方向 1 风险在本实验配置下不触发（关键结论）**：`block_reuse_on_allocate`
   在完整 grep 下为空，说明被 evict 的 block 全程未被 vLLM 重新分配。原因：
   free pool 充足，vLLM 优先用其他空闲 block。**方向 1 修复在本配置下安全。**
-- **方向 1 修复已实施**：在 `fix/prefix-cache-direction1-keep-hash-on-reclaim`
-  分支，`_evict_reclaimed_block_metadata` 在 `keep_prefix_cache_hash_on_reclaim=True`
-  （默认）时跳过 `_maybe_evict_cached_block`。可通过
-  `TRIATTN_RUNTIME_KEEP_PREFIX_CACHE_HASH_ON_RECLAIM=0` 恢复原始行为做 A/B 对比。
-  **待跑 P0 验证**（见第九节 9.2）。
+- **方向 1 修复已实施（路径 A 完整版）**：在 `fix/prefix-cache-direction1-keep-hash-on-reclaim`
+  分支，`_free_reclaimed_blocks` 在 `keep_prefix_cache_hash_on_reclaim=True`
+  （默认）时**同时跳过 evict hash 和 free_blocks**——被回收的物理块不进 free pool
+  （ref_cnt 保持 >0），登记为 pinned 孤儿块，请求结束时释放。这样 vLLM 不会
+  lazy evict 它们的 hash，第二次请求能 100% 命中完整 prompt 前缀。
+  - 方向 1 轻量版（只跳过 evict，仍 free_blocks）实测第二次命中率仅 22%——
+    因为 vLLM lazy evict 机制会在 allocate_slots 复用 free block 时清掉 hash。
+  - 路径 A 解决了 lazy evict 问题，预期第二次命中率 ~100%、TTFT 接近 Base 329ms。
+  - 内存代价：7 并发 × 122 block × 32MB ≈ 27GB 额外占用（pinned 块不释放直到请求结束）。
+  - 可通过 `TRIATTN_RUNTIME_KEEP_PREFIX_CACHE_HASH_ON_RECLAIM=0` 恢复原始行为做 A/B 对比。
+  - **待跑 P0 验证**（见第十节 10.6）。
 
 > **协作约定**：每次改完文档/代码后**自动 push** 到当前分支，无需额外确认。
 > 日志文件名固定为 `tmp.log`，grep 命令按第五节执行后把 `pctrace_*.log` 贴回 chat。
@@ -486,8 +492,10 @@ def _evict_reclaimed_block_metadata(block_pool, block):
 | 2026-06-22 | 同上 | 首轮观测（第二节）：根因 + 疑点 B/C 实锤，122 evict 与公式吻合（commit `47ccd1b`） |
 | 2026-06-22 | 同上 | grep 命令改为 `tmp.log`，补充 macOS 兼容写法与一键全跑脚本，明确自动 push 约定（commit `e1f099f`） |
 | 2026-06-22 | 同上 | 第二轮完整 grep（第三节）：根因闭环、required_blocks=34（报告公式偏差定位）、风险探针为空（本配置下安全）、修复前置条件满足（commit `b81a794`） |
-| 2026-06-22 | `fix/prefix-cache-direction1-keep-hash-on-reclaim` | 方向 1 最小修复：config 加 `keep_prefix_cache_hash_on_reclaim` 开关（默认 True），`_evict_reclaimed_block_metadata` 条件跳过 `_maybe_evict_cached_block`。待 P0 验证 |
-| 待定 | 同上 | P0 验证：evict 断点 hash 不再变 None / 第二次 TTFT 接近基线 / 紧张配置下 block_reuse 无 case A |
+| 2026-06-22 | `fix/prefix-cache-direction1-keep-hash-on-reclaim` | 方向 1 轻量版修复：config 加 `keep_prefix_cache_hash_on_reclaim` 开关，`_evict_reclaimed_block_metadata` 条件跳过 `_maybe_evict_cached_block`（commit `3743257`） |
+| 2026-06-22 | 同上 | 方向 1 轻量版实测：第二次 TTFT 1015ms（基线 329ms）、命中率 22%——不达标。根因：vLLM lazy evict 在 allocate_slots 复用 free block 时清掉保留的 hash |
+| 2026-06-22 | 同上 | 路径 A 完整修复：`_free_reclaimed_blocks` 同时跳过 evict 和 free_blocks，被回收块登记为 pinned 孤儿块；新增 `_release_pinned_blocks_for_request` 在请求结束时释放。预期第二次命中率 ~100% |
+| 待定 | 同上 | P0 验证：第二次 TTFT 接近 329ms / 命中率 ~100% / 无 OOM / 孤儿块释放 |
 
 ---
 
@@ -548,13 +556,127 @@ if callable(maybe_evict):
 
 ---
 
-## 十、关键文件索引
+## 十、改进版修复（路径 A，2026-06-22）
+
+### 10.1 为什么方向 1 轻量版（只跳过 evict）不够
+
+第九节的修复（只跳过 `_maybe_evict_cached_block`，但仍 `free_blocks`）实测结果：
+
+| 配置 | 第二次 TTFT | 第二次命中率 |
+|---|---|---|
+| Base 基线（无 TriAttention） | 329ms | ~100% |
+| 方向 1 修复前（KEEP=0） | 15396ms | ~22% |
+| 方向 1 轻量版（KEEP=1，只跳过 evict） | 1015ms | ~22% |
+
+TTFT 从 15396ms 降到 1015ms 是有改善（说明 hash 确实被保留了一部分），但远没到基线 329ms，命中率仍 22%。
+
+**根因**：vLLM BlockPool 是 **lazy evict** 机制。即使我在 TriAttention reclaim 时不 evict hash，`free_blocks` 仍把物理块归还 free pool（`ref_cnt`→0）。当后续请求（包括第二次请求自己）从 free pool 分配块时，如果该块带 hash，vLLM 会调用 `_maybe_evict_cached_block` 清掉 hash 来复用。所以保留的 122 个 hash 在第二次请求 prefill 分配阶段被 vLLM 自己清掉了，只剩 34 个 `ref_cnt>0` 的块能命中。
+
+实测 22% = 34/156，与"只命中保留的 34 个 block"完全吻合，证实了 lazy evict 是 hash 丢失的真正原因。
+
+### 10.2 路径 A 设计：被回收 block 不进 free pool
+
+**核心思路**：`_free_reclaimed_blocks` 当前做三件事：
+- (a) `_evict_reclaimed_block_metadata` → 清 hash（方向 1 已跳过）
+- (b) `block_pool.free_blocks(reversed(removed_blocks))` → 归还物理块到 free pool
+- (c) 调用前截断 `manager.req_to_blocks[req_id]` 和 `manager.num_cached_block[req_id]`（在 `_apply_compression_events` 里做，保留不变）
+
+路径 A：**同时跳过 (a) 和 (b)**，但保留 (c) 的截断。效果：
+- 被回收的 122 个物理块 `ref_cnt` 保持 >0，不进 free pool
+- vLLM 不会复用它们（`ref_cnt>0`），也不会 lazy evict 它们的 hash
+- 第二次请求 `_get_prompt_block_ids` 计算完整 prompt hash 链，能在 `cached_block` 里查到全部 156 个 hash → 100% 命中
+- TriAttention decode 加速不受影响（已验证：decode 时 NPU kernel 通过 input_patch 改写的 `seq_lens`/`positions` 限制 KV 范围，根本不索引被回收的 block）
+
+### 10.3 孤儿块（orphan block）处理
+
+跳过 (b) 后，122 个物理块 `ref_cnt>0` 但已从 `req_to_blocks[req_id]` 移除，变成无主块。请求结束时 vLLM 不会自动释放它们（因为不在 `req_to_blocks` 里）。需要主动释放：
+
+- `_free_reclaimed_blocks` 在路径 A 分支把 `removed_blocks` 登记到 `manager._triattention_pinned_blocks` 列表
+- 新增 `_release_pinned_blocks_for_request(manager, req_id)` 函数：请求 finish 时，把 `manager._triattention_pinned_blocks` 里属于该 req 的块归还 free pool（此时清 hash 是安全的，因为请求已结束）
+- 在 `update_from_output` 的 `finished_req_ids` 循环里调用 `_release_pinned_blocks_for_request`
+
+### 10.4 改动清单
+
+**`triattention/vllm/runtime/scheduler.py`**：
+
+1. `_free_reclaimed_blocks` 新增路径 A 分支：`keep_prefix_cache_hash_on_reclaim=True` 时跳过 `block_pool.free_blocks`，改为登记到 `manager._triattention_pinned_blocks`，并打印 `stage=post_pin` 断点。
+2. 新增 `_release_pinned_blocks_for_request(manager, req_id)` 函数：请求结束时释放该 req 的 pinned 块（先 evict hash，再 `free_blocks`）。
+3. `update_from_output` 的 `finished_req_ids` 循环增加调用 `_release_pinned_blocks_for_request`。
+
+`_apply_compression_events` 里的 `req_to_blocks` / `num_cached_block` 截断逻辑**保留不变**（这是逻辑层截断，让 vLLM scheduler 认为该请求只有 34 个 block，不影响物理块状态）。
+
+`config.py` 的 `keep_prefix_cache_hash_on_reclaim` 开关复用，语义变为"路径 A 完整修复"。
+
+### 10.5 理论讲解：第二次请求来时各 level hash 与 prefix hit 应该怎么工作
+
+```
+第一次请求（prompt 20000 token, 156 block, kv_budget=4096=34 block）:
+  Prefill 阶段:
+    - 156 个 block 逐个填满 KV，每个 block 的 hash 基于 prompt token id 序列计算
+    - 全部注册到 cached_block 反查表
+    - cached_block: {hash_0: block_0, hash_1: block_1, ..., hash_155: block_155}
+  压缩后（路径 A）:
+    - 保留前 34 个 block（ref_cnt=1，在 req_to_blocks 里）
+    - 后 122 个 block（ref_cnt=1，不在 req_to_blocks 里，登记为 pinned）
+    - cached_block 不变：仍保留全部 156 个 hash
+    - num_cached_block[req_id] = 34（逻辑层）
+    - NPU kernel decode 时通过 seq_lens=4096 只读前 34 个 block 的 KV
+    → TriAttention decode 加速特性保留
+
+第二次相同请求来时:
+  _get_prompt_block_ids 计算第二次 prompt 的 hash 链:
+    hash_0, hash_1, ..., hash_155（与第一次完全相同，因为 prompt 相同）
+  在 cached_block 里查找:
+    - hash_0 → block_0 (ref_cnt=1) ✓ hit
+    - hash_1 → block_1 (ref_cnt=1) ✓ hit
+    - ...
+    - hash_155 → block_155 (ref_cnt=1, pinned) ✓ hit
+  → 100% 命中，num_external_computed_tokens = 20000
+  → 第二次请求跳过全部 prefill，直接 decode
+  → TTFT ≈ 329ms（与 Base 一致）
+  → 第二次请求 decode 时同样被压缩到 kv_budget（TriAttention 特性保留）
+```
+
+对比方向 1 轻量版（只跳过 evict，但仍 free_blocks）为什么失败：
+
+```
+第一次请求压缩后:
+  - 后 122 个 block ref_cnt=0（已归还 free pool），但 hash 仍在 cached_block
+第二次请求来时:
+  _get_prompt_block_ids 查找:
+    - hash_0..33 → block_0..33 (ref_cnt=1) ✓ hit
+    - hash_34..155 → block_34..155 (ref_cnt=0, 在 free pool)
+      但第二次请求自己也要分配 block 做 prefill，vLLM 从 free pool 取块时
+      会 lazy evict 这些块的 hash → 匹配时已被清 → miss
+  → 只命中 34/156 = 22%（实测吻合）
+```
+
+### 10.6 验证清单（待跑）
+
+| 优先级 | 验证项 | 期望结果 | 命令 |
+|---|---|---|---|
+| P0 | 第二次 TTFT | 接近 Base 329ms | aisbench 两次请求 |
+| P0 | 第二次命中率 | ~100%（aisbench 显示 ~52% 因为是两次平均） | aisbench hit ratio |
+| P0 | 输出正确性 | 相同 prompt 输出一致；不同 prompt 不串味 | 人工核对 |
+| P0 | 无 OOM/preemption | 7 并发能跑完 | 看 vllm log 有无 preemption |
+| P1 | 孤儿块释放 | 请求结束后 pinned 列表清空 | `grep "stage=post_release_pin" pctrace_free.log` |
+| P1 | 内存代价 | 7×122 block × 32MB ≈ 27GB 额外占用，监控是否触发 preemption | vllm log |
+
+### 10.7 内存代价与回退
+
+内存代价：7 并发 × 122 block × 32MB/block ≈ 27GB 额外占用（不释放的物理块）。在 4×80GB/gpu_mem_util=0.9 配置下不会 OOM，但高并发长 prompt 场景需监控 preemption。
+
+回退：`export TRIATTN_RUNTIME_KEEP_PREFIX_CACHE_HASH_ON_RECLAIM=0` 恢复原始 evict+free 行为。
+
+---
+
+## 十一、关键文件索引
 
 | 文件 | 作用 |
 |---|---|
 | `triattention/vllm/runtime/_prefix_cache_debug.py` | 断点实现 + 总开关 |
-| `triattention/vllm/runtime/scheduler.py` | `_evict_reclaimed_block_metadata`（方向 1 修复点，已改）/ `_free_reclaimed_blocks` / `_apply_compression_events` |
-| `triattention/vllm/runtime/config.py` | `keep_prefix_cache_hash_on_reclaim` 配置项（已加） |
+| `triattention/vllm/runtime/scheduler.py` | `_evict_reclaimed_block_metadata`（跳过 evict）/ `_free_reclaimed_blocks`（路径 A 跳过 free_blocks + 孤儿块登记）/ `_release_pinned_blocks_for_request`（请求结束释放）/ `_apply_compression_events` / `update_from_output` |
+| `triattention/vllm/runtime/config.py` | `keep_prefix_cache_hash_on_reclaim` 配置项（默认 True=路径 A 生效） |
 | `triattention/vllm/runtime/integration_monkeypatch.py` | `_patched_kv_cache_allocate_slots`（疑点 B 修复点，未改） |
 | `triattention/vllm/runtime/runner.py` | `_supplement_worker_self_triggers`（疑点 C 修复点，未改） |
 | `docs/debug-prefix-cache-direction1.md` | 断点使用手册（怎么用） |
