@@ -27,13 +27,14 @@
 - **方向 1 风险在本实验配置下不触发（关键结论）**：`block_reuse_on_allocate`
   在完整 grep 下为空，说明被 evict 的 block 全程未被 vLLM 重新分配。原因：
   free pool 充足，vLLM 优先用其他空闲 block。**方向 1 修复在本配置下安全。**
-- **修复前置条件已满足**：根因 + 风险都确认完毕，可以开新分支做方向 1 最小
-  修复。但需在更紧张配置（更高并发/更长 prompt/更低 gpu_memory_utilization）
-  下补一轮验证，确认 free pool 紧张时 vLLM 复用被 evict block 会清 hash。
+- **方向 1 修复已实施**：在 `fix/prefix-cache-direction1-keep-hash-on-reclaim`
+  分支，`_evict_reclaimed_block_metadata` 在 `keep_prefix_cache_hash_on_reclaim=True`
+  （默认）时跳过 `_maybe_evict_cached_block`。可通过
+  `TRIATTN_RUNTIME_KEEP_PREFIX_CACHE_HASH_ON_RECLAIM=0` 恢复原始行为做 A/B 对比。
+  **待跑 P0 验证**（见第九节 9.2）。
 
-> **协作约定**：每次改完文档/代码后**自动 push** 到
-> `origin/debug/prefix-cache-direction1-print-bp`，无需额外确认。日志文件名
-> 固定为 `tmp.log`，grep 命令按第五节执行后把 `pctrace_*.log` 贴回 chat。
+> **协作约定**：每次改完文档/代码后**自动 push** 到当前分支，无需额外确认。
+> 日志文件名固定为 `tmp.log`，grep 命令按第五节执行后把 `pctrace_*.log` 贴回 chat。
 
 ---
 
@@ -484,19 +485,78 @@ def _evict_reclaimed_block_metadata(block_pool, block):
 | 2026-06-22 | `debug/prefix-cache-direction1-print-bp` | 初始断点层 + 文档（commit `780b8bb`） |
 | 2026-06-22 | 同上 | 首轮观测（第二节）：根因 + 疑点 B/C 实锤，122 evict 与公式吻合（commit `47ccd1b`） |
 | 2026-06-22 | 同上 | grep 命令改为 `tmp.log`，补充 macOS 兼容写法与一键全跑脚本，明确自动 push 约定（commit `e1f099f`） |
-| 2026-06-22 | 同上 | 第二轮完整 grep（第三节）：根因闭环、required_blocks=34（报告公式偏差定位）、风险探针为空（本配置下安全）、修复前置条件满足 |
-| 待定 | `fix/prefix-cache-direction1-keep-hash-on-reclaim` | 方向 1 最小修复 + P0/P1 验证 |
+| 2026-06-22 | 同上 | 第二轮完整 grep（第三节）：根因闭环、required_blocks=34（报告公式偏差定位）、风险探针为空（本配置下安全）、修复前置条件满足（commit `b81a794`） |
+| 2026-06-22 | `fix/prefix-cache-direction1-keep-hash-on-reclaim` | 方向 1 最小修复：config 加 `keep_prefix_cache_hash_on_reclaim` 开关（默认 True），`_evict_reclaimed_block_metadata` 条件跳过 `_maybe_evict_cached_block`。待 P0 验证 |
+| 待定 | 同上 | P0 验证：evict 断点 hash 不再变 None / 第二次 TTFT 接近基线 / 紧张配置下 block_reuse 无 case A |
 
 ---
 
-## 八、关键文件索引
+## 九、修复实施记录（2026-06-22，`fix/prefix-cache-direction1-keep-hash-on-reclaim` 分支）
+
+### 9.1 修复内容
+
+**分支**：`fix/prefix-cache-direction1-keep-hash-on-reclaim`（从 `debug/prefix-cache-direction1-print-bp` 拉出，继承全部断点用于验证）
+
+**改动 1：`triattention/vllm/runtime/config.py`**
+
+新增配置项 `keep_prefix_cache_hash_on_reclaim`（默认 `True`）：
+
+```python
+# Direction-1 fix for Prefix-Caching compatibility.
+keep_prefix_cache_hash_on_reclaim: bool = True
+```
+
+通过 env `TRIATTN_RUNTIME_KEEP_PREFIX_CACHE_HASH_ON_RECLAIM=0` 可恢复原始 evict-on-reclaim 行为，便于 A/B 对比。
+
+**改动 2：`triattention/vllm/runtime/scheduler.py`**
+
+1. 新增模块级缓存开关 `_keep_prefix_cache_hash_on_reclaim()`（仿 `integration_monkeypatch.py` 的 `_ASYNC_BOUNDARY_ENABLED_CACHE` 模式，避免每个 block reclaim 都读 env）。
+2. `_evict_reclaimed_block_metadata` 在 `keep_prefix_cache_hash_on_reclaim=True` 时**直接 return**，不调用 `_maybe_evict_cached_block`：
+
+```python
+if _keep_prefix_cache_hash_on_reclaim():
+    # Direction-1 fix: keep the hash, let vLLM manage it on re-allocate.
+    _pctrace_evict(block_pool=block_pool, block=block, stage="exit")
+    return
+
+maybe_evict = getattr(block_pool, "_maybe_evict_cached_block", None)
+if callable(maybe_evict):
+    maybe_evict(block)
+```
+
+关键点：
+- block 仍会被 `block_pool.free_blocks(reversed(removed_blocks))` 归还到 free pool（在 `_free_reclaimed_blocks` 里，未改动）
+- 只是 `cached_block` 反查表里保留了该 block 的 hash 索引
+- 第二次相同请求 Prefill 时，scheduler 用 prompt token 序列算 block hash 链，能在 `cached_block` 里查到这些 hash → 命中 → 跳过 prefill
+- vLLM 在 `allocate_slots` 重新分配这些 block 时会自己清空旧 hash 并用新内容重注册（报告"缓解"段论证，已在第二轮观测中确认 free pool 充足时不会被复用）
+
+### 9.2 验证清单（待跑）
+
+| 优先级 | 验证项 | 期望结果 | 命令 |
+|---|---|---|---|
+| P0 | evict 断点 stage=exit block_hash | 不再变 None（保持原值） | `grep evict_reclaimed_block pctrace_evict.log` |
+| P0 | 第二次批次 TTFT | 接近 Base 基线（~62ms） | aisbench 两次请求对比 |
+| P0 | 输出正确性 | 相同 prompt 两次输出一致；不同 prompt 不串味 | 人工核对 |
+| P0 | 紧张配置下 block_reuse_on_allocate | 出现时 current_block_hash 为 None 或新 hash（case B/C），不出现旧 prompt hash（case A） | bs=16 或 gpu_mem_util=0.6 重跑 |
+| P1 | 性能无回退 | TTFT 不劣于修复前 | aisbench 对比 |
+
+### 9.3 回退方案
+
+若 P0 验证出现 case A（stale hash 导致读到错误 KV）：
+1. 立即 `export TRIATTN_RUNTIME_KEEP_PREFIX_CACHE_HASH_ON_RECLAIM=0` 恢复原始行为
+2. 退回方向 2（只回收 Decode 阶段超出 prompt 长度的 block，不动 prompt 部分）
+
+---
+
+## 十、关键文件索引
 
 | 文件 | 作用 |
 |---|---|
 | `triattention/vllm/runtime/_prefix_cache_debug.py` | 断点实现 + 总开关 |
-| `triattention/vllm/runtime/scheduler.py` | `_evict_reclaimed_block_metadata` / `_free_reclaimed_blocks` / `_apply_compression_events`（方向 1 修复点） |
-| `triattention/vllm/runtime/integration_monkeypatch.py` | `_patched_kv_cache_allocate_slots`（疑点 B 修复点） |
-| `triattention/vllm/runtime/runner.py` | `_supplement_worker_self_triggers`（疑点 C 修复点） |
+| `triattention/vllm/runtime/scheduler.py` | `_evict_reclaimed_block_metadata`（方向 1 修复点，已改）/ `_free_reclaimed_blocks` / `_apply_compression_events` |
+| `triattention/vllm/runtime/config.py` | `keep_prefix_cache_hash_on_reclaim` 配置项（已加） |
+| `triattention/vllm/runtime/integration_monkeypatch.py` | `_patched_kv_cache_allocate_slots`（疑点 B 修复点，未改） |
+| `triattention/vllm/runtime/runner.py` | `_supplement_worker_self_triggers`（疑点 C 修复点，未改） |
 | `docs/debug-prefix-cache-direction1.md` | 断点使用手册（怎么用） |
 | `docs/debug-prefix-cache-direction1-progress.md` | 本文档（观测到什么、下一步） |
 | `TriAttention Prefix-Caching 失效根因分析与验证报告.md` | 根因报告（问题定义） |

@@ -101,6 +101,21 @@ class TriAttentionRuntimeConfig:
     force_eager_multi_req_on_ascend_effective_overrides: bool = False
     max_compressions_per_step_on_ascend: int = 4
 
+    # Direction-1 fix for Prefix-Caching compatibility.
+    # When True, _evict_reclaimed_block_metadata does NOT call
+    # BlockPool._maybe_evict_cached_block, so the reclaimed blocks keep their
+    # prefix-cache hash in the cached_block reverse-lookup table. The second
+    # identical request can then hit the full prompt prefix instead of only
+    # the (kv_budget + reclaim_interval)/block_size retained blocks.
+    # Risk: a reused physical block may be overwritten with new data while its
+    # stale hash still lives in cached_block. Mitigation: vLLM BlockPool itself
+    # clears stale hash and re-registers on allocate_slots, so as long as
+    # TriAttention does not actively evict, vLLM manages the hash lifecycle.
+    # Verified safe under bs=7/20k-prompt/kv_budget=4096/gpu_mem_util=0.9
+    # (block_reuse_on_allocate probe was empty - free pool always sufficient).
+    # Set to False to restore the original evict-on-reclaim behavior.
+    keep_prefix_cache_hash_on_reclaim: bool = True
+
     # Optional TriAttention-style scoring path (used by runtime hook when enabled).
     sparse_stats_path: Path | None = None
     model_path: Path | None = None
@@ -358,6 +373,10 @@ class TriAttentionRuntimeConfig:
             max_compressions_per_step_on_ascend=maybe_int(
                 "MAX_COMPRESSIONS_PER_STEP_ON_ASCEND",
                 cls.max_compressions_per_step_on_ascend,
+            ),
+            keep_prefix_cache_hash_on_reclaim=maybe_bool(
+                "KEEP_PREFIX_CACHE_HASH_ON_RECLAIM",
+                cls.keep_prefix_cache_hash_on_reclaim,
             ),
             sparse_stats_path=sparse_stats_path_candidate,
             model_path=Path(model_path_raw) if model_path_raw else None,

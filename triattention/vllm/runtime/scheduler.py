@@ -48,8 +48,43 @@ from ._prefix_cache_debug import (  # noqa: E402
 _pctrace_announce_active()
 
 
+# Direction-1 fix switch cache.  Read once per process from env to avoid
+# hitting os.environ on every reclaim (which fires per-block, per-request,
+# per-step).  Mirrors the _ASYNC_BOUNDARY_ENABLED_CACHE pattern in
+# integration_monkeypatch.py.  Set TRIATTN_RUNTIME_KEEP_PREFIX_CACHE_HASH_ON_RECLAIM=0
+# to restore the original evict-on-reclaim behavior.
+_KEEP_HASH_ON_RECLAIM_CACHE: bool | None = None
+
+
+def _keep_prefix_cache_hash_on_reclaim() -> bool:
+    """Return whether Direction-1 fix is active (keep hash, don't evict)."""
+    global _KEEP_HASH_ON_RECLAIM_CACHE
+    if _KEEP_HASH_ON_RECLAIM_CACHE is None:
+        try:
+            cfg = TriAttentionRuntimeConfig.from_env()
+            _KEEP_HASH_ON_RECLAIM_CACHE = bool(
+                getattr(cfg, "keep_prefix_cache_hash_on_reclaim", True)
+            )
+        except Exception:
+            # If config load fails, default to the fix being active (True),
+            # because that is the intended post-fix behavior.  The original
+            # behavior can always be restored via env=0 once config loads.
+            _KEEP_HASH_ON_RECLAIM_CACHE = True
+    return _KEEP_HASH_ON_RECLAIM_CACHE
+
+
 def _evict_reclaimed_block_metadata(block_pool: Any, block: Any) -> None:
-    """Best-effort clear of prefix-cache metadata before reusing a block."""
+    """Best-effort clear of prefix-cache metadata before reusing a block.
+
+    Direction-1 fix: when ``keep_prefix_cache_hash_on_reclaim`` is True
+    (default), this function is a no-op — the block's prefix-cache hash is
+    preserved in ``BlockPool.cached_block`` so the next identical request can
+    hit the full prompt prefix.  vLLM manages the hash lifecycle itself on
+    ``allocate_slots`` (it clears stale hashes and re-registers new ones),
+    so leaving the hash here is safe.  Set
+    ``TRIATTN_RUNTIME_KEEP_PREFIX_CACHE_HASH_ON_RECLAIM=0`` to restore the
+    original evict-on-reclaim behavior for A/B comparison.
+    """
     if block_pool is None or block is None:
         return
     block_hash = getattr(block, "block_hash", None)
@@ -60,11 +95,18 @@ def _evict_reclaimed_block_metadata(block_pool: Any, block: Any) -> None:
     # Direction 1 proposes to KEEP.  No-op when switch is off.
     _pctrace_evict(block_pool=block_pool, block=block, stage="enter")
 
+    if _keep_prefix_cache_hash_on_reclaim():
+        # Direction-1 fix: keep the hash, let vLLM manage it on re-allocate.
+        # The block still gets returned to free_blocks by the caller, but its
+        # cached_block entry stays so the next identical request can hit.
+        _pctrace_evict(block_pool=block_pool, block=block, stage="exit")
+        return
+
     maybe_evict = getattr(block_pool, "_maybe_evict_cached_block", None)
     if callable(maybe_evict):
         maybe_evict(block)
 
-    # [PCTRACE] observe the block AFTER the evict — under current behavior the
+    # [PCTRACE] observe the block AFTER the evict — under original behavior the
     # block_hash should now be None / removed from cached_block.
     _pctrace_evict(block_pool=block_pool, block=block, stage="exit")
 
