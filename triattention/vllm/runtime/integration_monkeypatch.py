@@ -41,11 +41,13 @@ from .worker import (
 from ._prefix_cache_debug import (  # noqa: E402
     trace_allocate_slots_patch as _pctrace_alloc,
     trace_block_reuse_on_allocate as _pctrace_reuse,
+    trace_protected_block_reuse_clear as _pctrace_protected_clear,
 )
 # Path C: block hash-protection helpers used by the patched
-# BlockPool._maybe_evict_cached_block to skip lazy evict on protected blocks.
+# BlockPool._maybe_evict_cached_block to clear stale hashes on reuse of
+# protected blocks (evict-on-rewrite).
 from .scheduler import (  # noqa: E402
-    _clear_block_hash_protection as _pctrace_clear_protection,
+    _evict_protected_block_hash as _pctrace_evict_protected,
     _is_block_hash_protected as _pctrace_is_protected,
 )
 
@@ -648,25 +650,48 @@ def _pctrace_maybe_trace_reuse(manager: Any, request: Any, result: Any) -> None:
 
 
 def _patched_maybe_evict_cached_block(self: Any, block: Any) -> Any:
-    """Path C: skip lazy evict for TriAttention hash-protected blocks.
+    """Path C: clear stale hash on reuse of TriAttention hash-protected blocks.
 
     vLLM's ``BlockPool._maybe_evict_cached_block`` is called from
     ``get_new_blocks`` whenever a block is reused from the free pool.  For
     blocks marked with ``_triattention_hash_protected`` (set by
-    ``_free_reclaimed_blocks`` during TriAttention compression reclaim), we
-    skip the evict so the block's prefix-cache hash stays in
-    ``cached_block`` and the next identical request can match it.
+    ``_free_reclaimed_blocks`` during TriAttention compression reclaim), the
+    hash was deliberately *kept* at reclaim time so a second identical request
+    could match it.  But now the block is being pulled for **new content**,
+    so its old hash is **definitively stale** — keeping it would:
 
-    Once a protected block is reused for new content, vLLM registers a fresh
-    hash for it (overwriting the old one).  We clear the protection flag at
-    that point so subsequent evicts behave normally.  Skipping evict on a
-    freshly-registered hash is harmless (it just keeps the correct new hash
-    alive a bit longer).
+      - crash upstream ``cache_full_blocks`` (``assert blk.block_hash is None``
+        before registering the new hash), and/or
+      - leave a stale ``cached_block_hash_to_block`` entry pointing at
+        overwritten content (the Direction-1 risk: "later hits read wrong KV"),
+        and under 120-different-prompt workloads grow that table unboundedly.
+
+    So at reuse time we do the opposite of "skip": we call
+    ``_evict_protected_block_hash`` to fully clear the hash
+    (``block.reset_hash()`` + remove the reverse-lookup entry) BEFORE the
+    block is overwritten.  The protection window (reclaim → reuse) is exactly
+    the window in which a second identical request could have matched; once
+    the block is being reused, that window is closed and the hash must go.
+
+    This is the "evict-on-rewrite" Path-C completion.  It is distinct from
+    upstream's ``_maybe_evict_cached_block`` in one important way: upstream
+    returns False **without** resetting the hash when the hash key is absent
+    from ``cached_block_hash_to_block`` (a known bug, vLLM PR #44237), which
+    would still crash ``cache_full_blocks``.  ``_evict_protected_block_hash``
+    calls ``reset_hash()`` **unconditionally**, so ``block.block_hash`` is
+    guaranteed None on return regardless of dict state.
+
+    Non-protected blocks fall through to the original upstream evict unchanged.
     """
     if _pctrace_is_protected(block):
-        # Clear protection so the block behaves normally on subsequent reuse.
-        _pctrace_clear_protection(block)
-        return None
+        had_hash = getattr(block, "block_hash", None) is not None
+        cleared = _pctrace_evict_protected(self, block)
+        # [PCTRACE] Path C correctness probe: had_hash=True + cleared=False
+        # would be a bug (stale hash left in place → cache_full_blocks crash).
+        _pctrace_protected_clear(
+            block_pool=self, block=block, had_hash=had_hash, cleared=cleared,
+        )
+        return cleared
     assert _ORIG_MAYBE_EVICT_CACHED_BLOCK is not None
     return _ORIG_MAYBE_EVICT_CACHED_BLOCK(self, block)
 

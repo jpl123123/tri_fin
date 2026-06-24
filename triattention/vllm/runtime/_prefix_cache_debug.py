@@ -150,6 +150,40 @@ def trace_evict_reclaimed_block(
 
 
 # ---------------------------------------------------------------------------
+# Breakpoint 1b: protected-block reuse-clear inside the patched
+# _maybe_evict_cached_block (Path C evict-on-rewrite)
+# ---------------------------------------------------------------------------
+
+def trace_protected_block_reuse_clear(
+    *,
+    block_pool: Any,
+    block: Any,
+    had_hash: bool,
+    cleared: bool,
+) -> None:
+    """Print when a TriAttention hash-protected block is pulled from the free
+    pool for reuse and its stale hash is cleared by Path C's evict-on-rewrite.
+
+    This is the *correctness-critical* Path C transition: it is where the
+    Direction-1 stale-hash risk is neutralized.  Observing it lets us confirm
+    that (a) protected blocks do get reused in real workloads (120 different
+    prompts), (b) their stale hash is non-None at reuse (``had_hash=True``),
+    and (c) the clear actually fired (``cleared=True``).  If ``had_hash=True``
+    but ``cleared=False`` ever appears, the block would crash upstream
+    ``cache_full_blocks`` (``assert blk.block_hash is None``) — that is the
+    smoking gun for the pre-fix bug.
+    """
+    if not _master_enabled():
+        return
+    bid = _block_id(block)
+    pool_id = hex(id(block_pool)) if block_pool is not None else "None"
+    _emit(
+        f"protected_block_reuse_clear block_id={bid} "
+        f"had_hash={had_hash} cleared={cleared} pool_id={pool_id}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Breakpoint 2: batch free inside _free_reclaimed_blocks
 # ---------------------------------------------------------------------------
 

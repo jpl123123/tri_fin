@@ -112,29 +112,38 @@ def _evict_reclaimed_block_metadata(block_pool: Any, block: Any) -> None:
 
 
 def _free_reclaimed_blocks(manager: Any, removed_blocks: list[Any]) -> bool:
-    """Free reclaimed tail blocks after clearing any stale prefix-cache identity.
+    """Free reclaimed tail blocks after applying Path-C hash protection.
 
     Path C (Direction-1 memory-efficient fix): when
     ``keep_prefix_cache_hash_on_reclaim`` is True, the reclaimed blocks are
-    returned to the free pool **with their prefix-cache hash protected** from
-    vLLM's lazy eviction.  Concretely each removed block is marked with
-    ``_triattention_hash_protected`` so that the patched
-    ``BlockPool._maybe_evict_cached_block`` skips its hash cleanup when vLLM
-    later reuses the block from the free pool.
+    returned to the free pool **with their prefix-cache hash protected** —
+    i.e. the hash is *kept* (not evicted) at reclaim time so the next
+    identical request can still match the full prompt prefix, but the
+    physical block is still released (``ref_cnt``→0) so KV memory stays
+    near baseline (~21% instead of Path A's 86%).
 
-    Effect chain:
-      - ``free_blocks`` returns the block to the free pool (``ref_cnt``→0),
-        so physical memory is reclaimed → KV usage stays near baseline (~21%
-        instead of Path A's 86%).
-      - The protected hash stays in ``cached_block`` so the next identical
-        request's ``_get_prompt_block_ids`` matches the full prompt prefix.
-      - On the second request's 100% hit, ``BlockPool.touch`` moves the block
-        out of the free queue (``ref_cnt`` 0→1) before any ``get_new_blocks``
-        call, so the protected block is never re-evicted.
-      - When the block is eventually reused for new content, vLLM registers a
-        fresh hash (overwriting the old one); the stale protection flag is
-        harmless because skipping evict on a freshly-registered hash only
-        keeps the (correct) new hash alive a bit longer.
+    Each removed block is marked with ``_triattention_hash_protected``.
+    The actual hash lifecycle is split across two points to avoid the
+    Direction-1 stale-hash risk:
+
+      - **Reclaim time (here):** keep ``block.block_hash`` and its
+        ``cached_block_hash_to_block`` entry intact; only mark the block
+        protected and call ``free_blocks``. This is the window in which a
+        second identical request can still match via ``_get_prompt_block_ids``
+        + ``BlockPool.touch`` (ref_cnt 0→1 pulls it out of the free queue
+        before any ``get_new_blocks`` reuses it).
+      - **Reuse time (``_patched_maybe_evict_cached_block``):** when vLLM's
+        ``get_new_blocks`` pulls a protected block out of the free pool for
+        new content, the patched evict calls
+        ``_evict_protected_block_hash`` to fully clear the now-stale hash
+        (``block.reset_hash()`` + remove the reverse-lookup entry) BEFORE
+        the block is overwritten. This is mandatory because upstream
+        ``cache_full_blocks`` asserts ``blk.block_hash is None`` before
+        registering a new hash, and a stale hash pointing at overwritten
+        content is exactly the Direction-1 risk. Without this, the block
+        would either crash ``cache_full_blocks`` or leave a stale entry
+        that pollutes ``cached_block_hash_to_block`` (unbounded growth
+        under 120-different-prompt workloads).
 
     The TriAttention decode speedup is unaffected because the NPU attention
     kernel is constrained by ``seq_lens`` (rewritten by input_patch to
@@ -189,13 +198,19 @@ _TRIATTENTION_HASH_PROTECTED_ATTR = "_triattention_hash_protected"
 
 
 def _mark_block_hash_protected(block: Any) -> None:
-    """Mark a block so vLLM's lazy evict skips its hash cleanup.
+    """Mark a block so its prefix-cache hash survives the reclaim→free path.
 
     The block is still returned to the free pool (``ref_cnt``=0), but its
-    prefix-cache hash stays in ``cached_block`` so the next identical request
-    can match it.  The protection is best-effort: if the block object refuses
-    the attribute set, we silently skip (correctness falls back to vLLM's
-    default lazy evict for that block).
+    prefix-cache hash stays in ``cached_block_hash_to_block`` so the next
+    identical request can match it.  Protection is **not** "skip evict
+    forever": the patched ``BlockPool._maybe_evict_cached_block`` consumes
+    the marker at reuse time and fully clears the (now-stale) hash via
+    ``_evict_protected_block_hash`` before the block is overwritten — see
+    the Direction-1 stale-hash risk discussion in
+    ``_free_reclaimed_blocks``.
+
+    Best-effort: if the block object refuses the attribute set, we silently
+    skip (correctness falls back to vLLM's default lazy evict for that block).
     """
     if block is None:
         return
@@ -222,6 +237,85 @@ def _clear_block_hash_protection(block: Any) -> None:
             setattr(block, _TRIATTENTION_HASH_PROTECTED_ATTR, False)
         except Exception:
             pass
+
+
+def _evict_protected_block_hash(block_pool: Any, block: Any) -> bool:
+    """Fully clear a protected block's prefix-cache hash at reuse time.
+
+    Called from the patched ``BlockPool._maybe_evict_cached_block`` when vLLM's
+    ``get_new_blocks`` pulls a TriAttention hash-protected block out of the
+    free pool for new content.  At this point the block's old hash is
+    **definitively stale** (the block is about to be overwritten), so we must:
+
+      1. Remove the ``block_hash → block`` entry from
+         ``cached_block_hash_to_block`` (handling the upstream
+         ``defaultdict(dict)`` shape), and
+      2. Call ``block.reset_hash()`` (NOT the ``block_hash`` setter — the
+         setter asserts ``block_hash is None`` and would raise).
+
+    This is mandatory for two reasons:
+      - Upstream ``cache_full_blocks`` asserts ``blk.block_hash is None``
+        before registering a new hash; leaving the stale hash would crash
+        it (or, on relaxed builds, silently corrupt the reverse-lookup
+        table by overwriting the entry).
+      - It realizes the Direction-1 risk mitigation: a reused physical
+        block whose stale hash still lives in ``cached_block`` would point
+        later hits at "content-changed" KV.  Clearing here guarantees no
+        stale hash outlives the reuse.
+
+    Unlike upstream ``_maybe_evict_cached_block`` (which returns False
+    *without* resetting when the hash key is absent from the dict — a known
+    bug fixed in vLLM PR #44237), this helper **unconditionally** calls
+    ``reset_hash()`` so ``block.block_hash`` is guaranteed None on return
+    regardless of dict state.  This is what makes Path C safe under the
+    collision / already-popped edge cases that tripped upstream.
+
+    Returns True if a hash was cleared, False if the block had no hash.
+    The protection flag is always cleared as part of this call.
+    """
+    if block is None:
+        return False
+    # Always drop the protection marker first so a failure below cannot
+    # leave the block "protected" forever (which would make every future
+    # reuse skip evict again).
+    _clear_block_hash_protection(block)
+
+    block_hash = getattr(block, "block_hash", None)
+    if block_hash is None:
+        return False
+
+    cache = getattr(block_pool, "cached_block_hash_to_block", None)
+    if cache is not None:
+        try:
+            blocks_by_id = cache.get(block_hash)
+            if blocks_by_id is not None:
+                block_id = getattr(block, "block_id", None)
+                blocks_by_id.pop(block_id, None)
+                if len(blocks_by_id) == 0:
+                    del cache[block_hash]
+        except Exception:
+            # Best-effort dict cleanup; the reset_hash() below is the
+            # correctness-critical step (it unblocks cache_full_blocks).
+            pass
+
+    reset_hash = getattr(block, "reset_hash", None)
+    if callable(reset_hash):
+        try:
+            reset_hash()
+        except Exception:
+            # Last resort: bypass the asserting setter by writing the
+            # private backing field directly.  KVCacheBlock stores the
+            # value in ``_block_hash``.
+            try:
+                setattr(block, "_block_hash", None)
+            except Exception:
+                pass
+    else:
+        try:
+            setattr(block, "_block_hash", None)
+        except Exception:
+            pass
+    return True
 
 
 def _resolve_full_prefill_len_from_request_like(request_like: Any) -> int:

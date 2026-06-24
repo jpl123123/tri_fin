@@ -52,6 +52,7 @@ vllm serve Qwen3-32B \
 | 4 | `trace_allocate_slots_patch` | `integration_monkeypatch._patched_kv_cache_allocate_slots` | 是否对压缩过的请求设置 `delay_cache_blocks=True`（疑点 B：永久跳过 hash 提交）。 |
 | 5 | `trace_worker_self_trigger` | `runner._supplement_worker_self_triggers` 4 个决策点 | 疑点 C：`defer_chunked_prefill` guard 何时失效，worker 何时自触发压缩。 |
 | 6 | `trace_block_reuse_on_allocate` | `integration_monkeypatch._patched_kv_cache_allocate_slots` 末尾 | **方向1风险观测点**：被 TriAttention 回收过的 block id 被 vLLM 重新分配给其他请求时，打印其当前 `block_hash`，判断属于 A/B/C 哪种情况（见下）。 |
+| 7 | `trace_protected_block_reuse_clear` | `integration_monkeypatch._patched_maybe_evict_cached_block`（保护块分支） | **路径 C 修复正确性探针**：保护块被复用时清 stale hash 的事件。`had_hash=True cleared=True` = 修复生效；`had_hash=True cleared=False` = 崩溃前兆（`cache_full_blocks` 即将 assert 失败）。120-prompt 负载下应大量出现前者、零后者。 |
 
 ### 2.1 断点 1 输出示例
 
