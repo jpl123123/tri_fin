@@ -35,6 +35,13 @@ from .worker import (
     _should_early_install_proxy,
     should_install_triattention_runner_proxy,
 )
+# Path C: block hash-protection helpers used by the patched
+# BlockPool._maybe_evict_cached_block to clear stale hashes on reuse of
+# protected blocks (evict-on-rewrite).
+from .scheduler import (  # noqa: E402
+    _evict_protected_block_hash as _pctrace_evict_protected,
+    _is_block_hash_protected as _pctrace_is_protected,
+)
 
 _PATCHED = False
 _PATCHED_SCHEDULER_ACTIVE = False
@@ -49,6 +56,7 @@ _ORIG_ASCEND_SET_FORWARD_CONTEXT: Callable[..., Any] | None = None
 _ORIG_ASCEND_MODEL_RUNNER_SET_FORWARD_CONTEXT: Callable[..., Any] | None = None
 _ORIG_KVCACHE_ALLOCATE_SLOTS: Callable[..., Any] | None = None
 _ORIG_ENGINE_CORE_STEP_WITH_BATCH_QUEUE: Callable[..., Any] | None = None
+_ORIG_MAYBE_EVICT_CACHED_BLOCK: Callable[..., Any] | None = None
 _DEFER_PREFILL_BOUNDARY_CACHE: bool | None = None
 _ASYNC_BOUNDARY_ENABLED_CACHE: bool | None = None
 
@@ -540,6 +548,46 @@ def _patched_kv_cache_allocate_slots(
         setattr(request, "num_computed_tokens", logical_num_computed)
 
 
+def _patched_maybe_evict_cached_block(self: Any, block: Any) -> Any:
+    """Path C: clear stale hash on reuse of TriAttention hash-protected blocks.
+
+    vLLM's ``BlockPool._maybe_evict_cached_block`` is called from
+    ``get_new_blocks`` whenever a block is reused from the free pool.  For
+    blocks marked with ``_triattention_hash_protected`` (set by
+    ``_free_reclaimed_blocks`` during TriAttention compression reclaim), the
+    hash was deliberately *kept* at reclaim time so a second identical request
+    could match it.  But now the block is being pulled for **new content**,
+    so its old hash is **definitively stale** — keeping it would:
+
+      - crash upstream ``cache_full_blocks`` (``assert blk.block_hash is None``
+        before registering the new hash), and/or
+      - leave a stale ``cached_block_hash_to_block`` entry pointing at
+        overwritten content (the Direction-1 risk: "later hits read wrong KV"),
+        and under 120-different-prompt workloads grow that table unboundedly.
+
+    So at reuse time we do the opposite of "skip": we call
+    ``_evict_protected_block_hash`` to fully clear the hash
+    (``block.reset_hash()`` + remove the reverse-lookup entry) BEFORE the
+    block is overwritten.  The protection window (reclaim → reuse) is exactly
+    the window in which a second identical request could have matched; once
+    the block is being reused, that window is closed and the hash must go.
+
+    This is the "evict-on-rewrite" Path-C completion.  It is distinct from
+    upstream's ``_maybe_evict_cached_block`` in one important way: upstream
+    returns False **without** resetting the hash when the hash key is absent
+    from ``cached_block_hash_to_block`` (a known bug, vLLM PR #44237), which
+    would still crash ``cache_full_blocks``.  ``_evict_protected_block_hash``
+    calls ``reset_hash()`` **unconditionally**, so ``block.block_hash`` is
+    guaranteed None on return regardless of dict state.
+
+    Non-protected blocks fall through to the original upstream evict unchanged.
+    """
+    if _pctrace_is_protected(block):
+        return _pctrace_evict_protected(self, block)
+    assert _ORIG_MAYBE_EVICT_CACHED_BLOCK is not None
+    return _ORIG_MAYBE_EVICT_CACHED_BLOCK(self, block)
+
+
 def _scheduler_output_has_compression_boundary(scheduler_output: Any) -> bool:
     if not _async_compression_boundary_enabled():
         return False
@@ -698,6 +746,7 @@ def install_vllm_integration_monkeypatches(
     global _PATCHED, _ORIG_SCHED_INIT, _ORIG_SCHED_SCHEDULE, _ORIG_SCHED_UPDATE_FROM_OUTPUT
     global _ORIG_WORKER_INIT_DEVICE, _ORIG_WORKER_EXECUTE_MODEL
     global _ORIG_KVCACHE_ALLOCATE_SLOTS, _ORIG_ENGINE_CORE_STEP_WITH_BATCH_QUEUE
+    global _ORIG_MAYBE_EVICT_CACHED_BLOCK
     global _PATCHED_SCHEDULER_ACTIVE, _PATCHED_WORKER_ACTIVE
     if _PATCHED:
         if patch_worker and not _PATCHED_WORKER_ACTIVE:
@@ -748,6 +797,28 @@ def install_vllm_integration_monkeypatches(
         KVCacheManager.allocate_slots = _patched_kv_cache_allocate_slots
         _ORIG_ENGINE_CORE_STEP_WITH_BATCH_QUEUE = EngineCore.step_with_batch_queue
         EngineCore.step_with_batch_queue = _patched_engine_core_step_with_batch_queue
+
+        # Path C: patch BlockPool._maybe_evict_cached_block to skip lazy evict
+        # on TriAttention hash-protected blocks, so their prefix-cache hash
+        # survives in cached_block for the next identical request to match.
+        try:
+            from vllm.v1.core.block_pool import BlockPool as _V1BlockPool
+            _ORIG_MAYBE_EVICT_CACHED_BLOCK = _V1BlockPool._maybe_evict_cached_block
+            _V1BlockPool._maybe_evict_cached_block = _patched_maybe_evict_cached_block
+            if runtime_logging_enabled():
+                logger.info(
+                    "TriAttention Path-C: patched BlockPool._maybe_evict_cached_block "
+                    "to skip lazy evict on hash-protected blocks"
+                )
+        except (ImportError, AttributeError) as _e:
+            _ORIG_MAYBE_EVICT_CACHED_BLOCK = None
+            if runtime_logging_enabled():
+                logger.warning(
+                    "TriAttention Path-C: could not patch "
+                    "BlockPool._maybe_evict_cached_block (%s); "
+                    "hash protection inactive, falling back to default evict",
+                    _e,
+                )
 
     if patch_worker:
         _install_worker_patches(Worker)
